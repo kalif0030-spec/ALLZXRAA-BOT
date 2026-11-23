@@ -91,7 +91,7 @@ function loadConfig() {
     thumbnailUrl: cleanUrl(pick('THUMBNAIL_URL', 'thumbnailUrl')),
     // UNSET kalau kosong: fitur itu nonaktif dan diberi tahu di log saat start.
     welcomeChannelId: cleanSnowflake(pick('WELCOME_CHANNEL_ID', '1540584065068048405')),
-    goodbyeChannelId: cleanSnowflake(pick('GOODBYE_CHANNEL_ID', '1540584065068048405)),
+    goodbyeChannelId: cleanSnowflake(pick('GOODBYE_CHANNEL_ID', '1540584065068048405')),
     inviteLogChannelId: cleanSnowflake(pick('INVITE_LOG_CHANNEL_ID', '1574202934365790258')),
     obfu: Object.freeze({
       key: cleanIntArray(pick('OBFU_KEY', 'obfuKey'), DEFAULT_OBFU_KEY),
