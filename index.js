@@ -3,7 +3,6 @@ const axios = require('axios');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// Banner Asli ALLZXRAA (Buat di dalem file)
 const bannerArt = `
  █████╗ ██╗     ██╗     ███████╗██╗  ██╗██████╗  █████╗  █████╗ 
 ██╔══██╗██║     ██║     ╚══███╔╝╚██╗██╔╝██╔══██╗██╔══██╗██╔══██╗
@@ -14,7 +13,6 @@ const bannerArt = `
                ALLZXRAA COMMUNITY BOT
 `;
 
-// Fungsi XOR
 function xorCipher(str, key) {
     let result = "";
     for (let i = 0; i < str.length; i++) {
@@ -23,7 +21,6 @@ function xorCipher(str, key) {
     return result;
 }
 
-// Fungsi Format ke Lua (\xxx)
 function formatToLua(str) {
     let luaFormat = "";
     for (let i = 0; i < str.length; i++) {
@@ -32,7 +29,6 @@ function formatToLua(str) {
     return luaFormat;
 }
 
-// Fungsi Ambil Teks dari Link
 async function getTextFromUrl(url) {
     try {
         const response = await axios.get(url, { responseType: 'text' });
@@ -42,31 +38,29 @@ async function getTextFromUrl(url) {
     }
 }
 
-// ==========================================
-// SLASH COMMANDS
-// ==========================================
 const commands = [
     new SlashCommandBuilder()
         .setName('obfuscate')
-        .setDescription('Obfuscate teks atau link, hasilnya langsung di-download')
-        .addStringOption(opt => opt.setName('input').setDescription('Teks atau Link (https://...)').setRequired(true)),
+        .setDescription('Obfuscate teks, link, atau file .lua')
+        .addStringOption(opt => opt.setName('teks').setDescription('Ketik teks manual (opsional)'))
+        .addStringOption(opt => opt.setName('link').setDescription('Paste link raw (opsional)'))
+        .addAttachmentOption(opt => opt.setName('file').setDescription('Upload file .lua (opsional)')),
         
     new SlashCommandBuilder()
         .setName('deobfuscate')
-        .setDescription('Deobfuscate teks atau link, hasilnya langsung di-download')
-        .addStringOption(opt => opt.setName('input').setDescription('Teks obfu atau Link file').setRequired(true))
-        .addStringOption(opt => opt.setName('key').setDescription('Key rahasia').setRequired(true)),
+        .setDescription('Deobfuscate teks, link, atau file .lua')
+        .addStringOption(opt => opt.setName('teks').setDescription('Ketik teks obfu manual (opsional)'))
+        .addStringOption(opt => opt.setName('link').setDescription('Paste link raw (opsional)'))
+        .addAttachmentOption(opt => opt.setName('file').setDescription('Upload file .lua obfu (opsional)')),
 ];
 
-client.once('ready', async () => {
+client.once('clientReady', async () => { // Pake clientReady biar gak ada warning
     console.log(`[+] Bot ${client.user.tag} online!`);
     const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
     try {
         await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
         console.log('[+] Slash commands berhasil didaftarin!');
-    } catch (e) { 
-        console.error(e); 
-    }
+    } catch (e) { console.error(e); }
 });
 
 client.on('interactionCreate', async interaction => {
@@ -76,55 +70,69 @@ client.on('interactionCreate', async interaction => {
     // ================= COMMAND OBFUSCATE =================
     if (commandName === 'obfuscate') {
         await interaction.deferReply(); 
-        let input = interaction.options.getString('input');
-        const key = 'ALLZXRAA'; // Key rahasia
-        let isLink = input.startsWith('http');
+        const teksManual = interaction.options.getString('teks');
+        const linkInput = interaction.options.getString('link');
+        const fileInput = interaction.options.getAttachment('file');
+        const key = 'ALLZXRAA'; // Key otomatis
 
-        let originalText = input;
-        if (isLink) {
-            originalText = await getTextFromUrl(input);
-            if (!originalText) return interaction.editReply('❌ Gagal ambil file dari link sayang~');
+        let originalText = "";
+
+        try {
+            if (fileInput) {
+                const res = await axios.get(fileInput.url, { responseType: 'text' });
+                originalText = res.data;
+            } else if (linkInput) {
+                originalText = await getTextFromUrl(linkInput);
+            } else if (teksManual) {
+                originalText = teksManual;
+            }
+
+            if (!originalText) return interaction.editReply('❌ Kamu harus isi salah satu: Teks, Link, atau Upload File sayang~');
+
+            const obfuscated = xorCipher(originalText, key);
+            const luaFormat = formatToLua(obfuscated);
+            const finalOutput = `--[[\n${bannerArt}\n]]\n-- [ OBFUSCATED BY ALLZXRAA BOT ]\nlocal script = "${luaFormat}"\nloadstring(script)()\n\n--[[\n--- KODE ASLI ---\n${originalText}\n]]`;
+
+            const buffer = Buffer.from(finalOutput, 'utf-8');
+            const attachment = new AttachmentBuilder(buffer, { name: 'obfuscated_output.lua' });
+
+            const embed = new EmbedBuilder()
+                .setTitle('🛡️ Obfuscate Berhasil')
+                .setColor('Blue')
+                .setDescription(`📁 Sumber: ${fileInput ? 'Upload File' : linkInput ? 'Link' : 'Teks Manual'}`)
+                .addFields({ name: 'Status', value: 'File hasil obfu siap di-download!' });
+
+            await interaction.editReply({ embeds: [embed], files: [attachment] });
+
+        } catch (e) {
+            await interaction.editReply('❌ Gagal memproses file/link sayang~ pastiin filenya bener ya 🥺');
         }
-
-        // Proses Obfuscate
-        const obfuscated = xorCipher(originalText, key);
-        const luaFormat = formatToLua(obfuscated);
-
-        // Gabungin Banner + Hasil Obfu + Kode Asli (comment)
-        const finalOutput = `--[[\n${bannerArt}\n]]\n-- [ OBFUSCATED BY ALLZXRAA BOT ]\nlocal script = "${luaFormat}"\nloadstring(script)()\n\n--[[\n--- KODE ASLI ---\n${originalText}\n]]`;
-
-        // Bikin file buat di-download
-        const buffer = Buffer.from(finalOutput, 'utf-8');
-        const attachment = new AttachmentBuilder(buffer, { name: 'obfuscated_output.lua' });
-
-        const embed = new EmbedBuilder()
-            .setTitle('🛡️ Obfuscate Berhasil')
-            .setColor('Blue')
-            .setDescription(isLink ? `📁 Diambil dari: ${input}` : `📝 Diinput manual`)
-            .addFields({ name: 'Status', value: 'File hasil obfu siap di-download! (Banner & Kode asli udah masuk ke dalam file)' });
-
-        await interaction.editReply({ embeds: [embed], files: [attachment] });
     }
 
     // ================= COMMAND DEOBFUSCATE =================
     if (commandName === 'deobfuscate') {
         await interaction.deferReply();
-        let input = interaction.options.getString('input');
-        const key = interaction.options.getString('key');
-        let isLink = input.startsWith('http');
+        const teksManual = interaction.options.getString('teks');
+        const linkInput = interaction.options.getString('link');
+        const fileInput = interaction.options.getAttachment('file');
+        const key = 'ALLZXRAA'; // Key otomatis (sama kayak obfuscate)
 
-        let textToDecode = input;
-        if (isLink) {
-            textToDecode = await getTextFromUrl(input);
-            if (!textToDecode) return interaction.editReply('❌ Gagal ambil file dari link sayang~');
-        }
+        let textToDecode = "";
 
         try {
-            // Bersihin format \xxx jadi karakter asli
+            if (fileInput) {
+                const res = await axios.get(fileInput.url, { responseType: 'text' });
+                textToDecode = res.data;
+            } else if (linkInput) {
+                textToDecode = await getTextFromUrl(linkInput);
+            } else if (teksManual) {
+                textToDecode = teksManual;
+            }
+
+            if (!textToDecode) return interaction.editReply('❌ Kamu harus isi salah satu: Teks, Link, atau Upload File sayang~');
+
             const parsedTeks = textToDecode.replace(/\\(\d{1,3})/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)));
             const decoded = xorCipher(parsedTeks, key);
-
-            // Gabungin Banner + Hasil Deobfu
             const finalOutput = `--[[\n${bannerArt}\n]]\n-- [ DEOBFUSCATED BY ALLZXRAA BOT ]\n\n${decoded}`;
 
             const buffer = Buffer.from(finalOutput, 'utf-8');
@@ -133,12 +141,13 @@ client.on('interactionCreate', async interaction => {
             const embed = new EmbedBuilder()
                 .setTitle('🔓 Deobfuscate Berhasil')
                 .setColor('Green')
-                .setDescription(isLink ? `📁 Diambil dari: ${input}` : `📝 Diinput manual`)
-                .addFields({ name: 'Status', value: 'File hasil deobfu siap di-download! (Banner udah masuk ke file)' });
+                .setDescription(`📁 Sumber: ${fileInput ? 'Upload File' : linkInput ? 'Link' : 'Teks Manual'}`)
+                .addFields({ name: 'Status', value: 'File hasil deobfu siap di-download!' });
 
             await interaction.editReply({ embeds: [embed], files: [attachment] });
+
         } catch (e) {
-            await interaction.editReply('❌ Gagal decode sayang~ formatnya salah atau key-nya beda 🥺');
+            await interaction.editReply('❌ Gagal decode sayang~ formatnya salah atau filenya bukan hasil obfu bot ini 🥺');
         }
     }
 });
