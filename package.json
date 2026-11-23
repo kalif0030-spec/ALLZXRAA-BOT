@@ -1,9 +1,0 @@
-{
-  "name": "link-resolver-bot",
-  "version": "1.0.0",
-  "main": "index.js",
-  "private": true,
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node index.js" },
-  "dependencies": { "discord.js": "^14.14.0" }
-}
