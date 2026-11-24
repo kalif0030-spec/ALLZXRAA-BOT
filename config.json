@@ -1,5 +1,7 @@
 {
   "welcomeChannelId": "1540584065068048405",
   "goodbyeChannelId": "1540584065068048405",
-  "inviteLogChannelId": "1574202934365790258"
+  "inviteLogChannelId": "1574202934365790258",
+  "assetCommandChannelId": "1541328870609780746",
+  "assetDropChannelId": "1554291262822285342"
 }
