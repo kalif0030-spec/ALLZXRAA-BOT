@@ -1,7 +1,7 @@
 'use strict';
 
 // Satu file: welcome/goodbye, obfuscator (format sama seperti ALLZRA_main.lua),
-// obfu link aman dari SSRF, sistem XP + level + leaderboard, invite log, dan /war (drop file acak).
+// obfu link aman dari SSRF, sistem XP + level + leaderboard, dan invite log.
 
 const crypto = require('node:crypto');
 const dns = require('node:dns').promises;
@@ -10,7 +10,7 @@ const net = require('node:net');
 const path = require('node:path');
 const {
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
-  MessageFlags, Partials, PermissionFlagsBits, SlashCommandBuilder,
+  MessageFlags, PermissionFlagsBits, SlashCommandBuilder,
 } = require('discord.js');
 
 // ============ konstanta ============
@@ -93,8 +93,6 @@ function loadConfig() {
     welcomeChannelId: cleanSnowflake(pick('WELCOME_CHANNEL_ID', 'welcomeChannelId')),
     goodbyeChannelId: cleanSnowflake(pick('GOODBYE_CHANNEL_ID', 'goodbyeChannelId')),
     inviteLogChannelId: cleanSnowflake(pick('INVITE_LOG_CHANNEL_ID', 'inviteLogChannelId')),
-    assetCommandChannelId: cleanSnowflake(pick('ASSET_COMMAND_CHANNEL_ID', 'assetCommandChannelId')),
-    assetDropChannelId: cleanSnowflake(pick('ASSET_DROP_CHANNEL_ID', 'assetDropChannelId')),
     obfu: Object.freeze({
       key: cleanIntArray(pick('OBFU_KEY', 'obfuKey'), DEFAULT_OBFU_KEY),
       chunkHexChars: 4096,
@@ -341,15 +339,18 @@ function loadXpStore() {
 const xpSaver = createSaver(XP_DATA_FILE, () => ({ users: Object.fromEntries(users) }));
 
 // Anti-spam: cuma dapat XP sekali per XP_COOLDOWN_MS per user per server.
+// Mengembalikan null kalau masih cooldown. Kalau dapat XP, kembalikan { leveledUp, level }.
 function awardXp(guildId, userId, now = Date.now()) {
   const key = `${guildId}:${userId}`;
   const entry = users.get(key) || { xp: 0, lastAt: 0 };
-  if (now - entry.lastAt < XP_COOLDOWN_MS) return false;
+  if (now - entry.lastAt < XP_COOLDOWN_MS) return null;
+  const before = levelInfo(entry.xp).level;
   entry.xp += XP_MIN + crypto.randomInt(XP_MAX - XP_MIN + 1);
   entry.lastAt = now;
   users.set(key, entry);
   xpSaver.schedule();
-  return true;
+  const after = levelInfo(entry.xp).level;
+  return { leveledUp: after > before, level: after };
 }
 
 function guildRanking(guildId) {
@@ -360,6 +361,45 @@ function guildRanking(guildId) {
   }
   rows.sort((a, b) => b.xp - a.xp || a.userId.localeCompare(b.userId));
   return rows;
+}
+
+// Berikan semua role yang levelnya sudah tercapai dan belum dimiliki. Mengembalikan role yang baru diberikan.
+async function applyLevelRoles(guild, userId, level) {
+  const due = levelRolesFor(guild.id).filter((r) => r.level <= level);
+  if (due.length === 0) return [];
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return [];
+  const granted = [];
+  for (const r of due) {
+    if (member.roles.cache.has(r.roleId)) continue;
+    const role = guild.roles.cache.get(r.roleId) ?? (await guild.roles.fetch(r.roleId).catch(() => null));
+    if (!role) {
+      console.warn(`level role: role ${r.roleId} (level ${r.level}) tidak ditemukan`);
+      continue;
+    }
+    if (!role.editable) {
+      console.warn(`level role: bot tidak bisa mengelola role ${role.name} (butuh izin Manage Roles dan role bot di atas role ini)`);
+      continue;
+    }
+    try {
+      await member.roles.add(role, `Naik ke level ${level}`);
+      granted.push(role);
+    } catch (err) {
+      console.warn(`level role: gagal memberi ${role.name} (${err.message})`);
+    }
+  }
+  return granted;
+}
+
+function levelUpEmbed(user, level, roles = []) {
+  const roleLine = roles.length ? `\nRole baru: ${roles.map((r) => `<@&${r.id}>`).join(' ')}` : '';
+  return new EmbedBuilder()
+    .setColor(COLOR_LEVEL)
+    .setAuthor({ name: 'Level Up!', iconURL: user.displayAvatarURL() })
+    .setDescription(`Selamat ${user}, kamu naik ke **Level ${level}**!${roleLine}`)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+    .setTimestamp();
 }
 
 function levelCardEmbed(user, guildId) {
@@ -731,11 +771,537 @@ function warnIfSecretsInRepoFiles() {
   }
 }
 
+// ============ role hadiah level (/level-role) ============
+const LEVEL_ROLES_FILE = path.join(__dirname, 'level-roles.json');
+const levelRoleStore = new Map(); // guildId -> Map<level, roleId>
+
+function loadLevelRoles() {
+  const raw = readJsonFile(LEVEL_ROLES_FILE);
+  if (!raw || typeof raw !== 'object') return;
+  for (const [guildId, map] of Object.entries(raw)) {
+    if (!cleanSnowflake(guildId) || !map || typeof map !== 'object') continue;
+    const m = new Map();
+    for (const [lvl, roleId] of Object.entries(map)) {
+      const level = Number.parseInt(lvl, 10);
+      if (Number.isInteger(level) && level >= 1 && level <= MAX_LEVEL && cleanSnowflake(String(roleId))) {
+        m.set(level, String(roleId));
+      }
+    }
+    levelRoleStore.set(guildId, m);
+  }
+}
+
+const levelRoleSaver = createSaver(LEVEL_ROLES_FILE, () =>
+  Object.fromEntries([...levelRoleStore].map(([g, m]) => [g, Object.fromEntries(m)])));
+
+function levelRolesFor(guildId) {
+  const m = levelRoleStore.get(guildId) ?? new Map();
+  return [...m.entries()].map(([level, roleId]) => ({ level, roleId })).sort((a, b) => a.level - b.level);
+}
+
+async function handleLevelRole(interaction) {
+  const guild = interaction.guild;
+  const reply = (description, color = COLOR_LEVEL) => interaction.reply({
+    embeds: [new EmbedBuilder().setColor(color).setDescription(description).setFooter({ text: `Powered by ${cfg.poweredBy}` })],
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+  if (!guild) return reply('Perintah ini cuma bisa dipakai di server.', COLOR_FAIL);
+  const isAdmin = guild.ownerId === interaction.user.id
+    || Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.Administrator));
+  if (!isAdmin) return reply('Cuma owner atau admin yang bisa atur role level.', COLOR_FAIL);
+
+  const sub = interaction.options.getSubcommand();
+  const roles = levelRoleStore.get(guild.id) ?? new Map();
+
+  if (sub === 'list') {
+    const rows = levelRolesFor(guild.id).map((r) => `Level **${r.level}** → <@&${r.roleId}>`);
+    return reply(rows.length ? rows.join('\n') : 'Belum ada role hadiah level.');
+  }
+
+  const level = interaction.options.getInteger('level', true);
+  if (sub === 'remove') {
+    if (!roles.has(level)) return reply(`Level ${level} belum punya role hadiah.`, COLOR_FAIL);
+    roles.delete(level);
+    levelRoleStore.set(guild.id, roles);
+    levelRoleSaver.save();
+    return reply(`Role hadiah level ${level} dihapus.`);
+  }
+
+  // sub === 'set'
+  const role = interaction.options.getRole('role', true);
+  if (role.managed || role.id === guild.id) return reply('Role itu tidak bisa dipakai sebagai hadiah.', COLOR_FAIL);
+  if (!role.editable) {
+    return reply('Bot tidak bisa mengelola role itu. Pastikan bot punya izin Manage Roles dan role bot ada di atas role tersebut.', COLOR_FAIL);
+  }
+  roles.set(level, role.id);
+  levelRoleStore.set(guild.id, roles);
+  levelRoleSaver.save();
+  return reply(`Level ${level} sekarang memberi role <@&${role.id}>.`);
+}
+// ============ akhir role hadiah level ============
+
+// ============ command tambahan: ping, rank, invites, xp-give, level-sync ============
+const LEVEL_SYNC_MAX = 500; // batas member yang dicek per /level-sync, supaya tidak kena timeout interaksi
+
+function isServerAdmin(interaction) {
+  return interaction.guild.ownerId === interaction.user.id
+    || Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.Administrator));
+}
+
+async function handlePing(interaction) {
+  await interaction.reply({
+    embeds: [new EmbedBuilder().setColor(COLOR_INFO).setDescription(`Pong! Latency websocket **${client.ws.ping} ms**.`)
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` }).setTimestamp()],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleRank(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const user = interaction.options.getUser('user') ?? interaction.user;
+  await interaction.reply({ embeds: [levelCardEmbed(user, interaction.guild.id)] });
+}
+
+async function handleInvites(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const user = interaction.options.getUser('user') ?? interaction.user;
+  const c = inviteCounts.get(`${interaction.guild.id}:${user.id}`) || { invited: 0, left: 0 };
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_INVITE)
+    .setAuthor({ name: `Invite — ${user.username}`, iconURL: user.displayAvatarURL() })
+    .addFields(
+      { name: 'Total diundang', value: `${c.invited}`, inline: true },
+      { name: 'Sudah keluar', value: `${c.left}`, inline: true },
+      { name: 'Masih bertahan', value: `${Math.max(0, c.invited - c.left)}`, inline: true },
+    )
+    .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+    .setTimestamp();
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleXpGive(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) {
+    return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  }
+  const user = interaction.options.getUser('user', true);
+  const amount = interaction.options.getInteger('jumlah', true);
+  const key = `${interaction.guild.id}:${user.id}`;
+  const entry = users.get(key) || { xp: 0, lastAt: 0 };
+  entry.xp = Math.max(0, entry.xp + amount);
+  users.set(key, entry);
+  xpSaver.schedule();
+  const info = levelInfo(entry.xp);
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR_LEVEL)
+      .setDescription(`XP ${user} sekarang **${entry.xp}** (Level ${info.level}). Perubahan: ${amount >= 0 ? '+' : ''}${amount}.`)
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleLevelSync(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) {
+    return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  }
+  const guild = interaction.guild;
+  if (levelRolesFor(guild.id).length === 0) {
+    return interaction.reply({ content: 'Belum ada role hadiah level. Pasang dulu dengan /level-role set.', flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const prefix = `${guild.id}:`;
+  const all = [...users.entries()].filter(([k]) => k.startsWith(prefix));
+  const targets = all.slice(0, LEVEL_SYNC_MAX);
+  let granted = 0;
+  for (const [key, v] of targets) {
+    const roles = await applyLevelRoles(guild, key.slice(prefix.length), levelInfo(v.xp).level);
+    granted += roles.length;
+  }
+  const note = all.length > LEVEL_SYNC_MAX ? ` Dibatasi ${LEVEL_SYNC_MAX} member pertama, jalankan lagi untuk sisanya.` : '';
+  await interaction.editReply({ content: `Selesai. ${targets.length} member dicek, ${granted} role baru diberikan.${note}` });
+}
+// ============ akhir command tambahan ============
+
+// ============ command tambahan: help, userinfo, serverinfo, avatar, xp-reset ============
+function unixTagged(date, style = 'F') {
+  return `<t:${Math.floor(new Date(date).getTime() / 1000)}:${style}>`;
+}
+
+async function handleHelp(interaction) {
+  const lines = commands.map((c) => `\`/${c.name}\` — ${c.description}`);
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR_INFO)
+      .setTitle(`Bantuan — ${cfg.brandName}`)
+      .setDescription(lines.join('\n'))
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleUserinfo(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const user = interaction.options.getUser('user') ?? interaction.user;
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_INFO)
+    .setAuthor({ name: user.tag })
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .addFields(
+      { name: 'ID', value: user.id, inline: true },
+      { name: 'Akun dibuat', value: unixTagged(user.createdAt), inline: true },
+      { name: 'Bergabung', value: member?.joinedAt ? unixTagged(member.joinedAt) : 'Bukan member', inline: true },
+      { name: 'Jumlah role', value: member ? `${member.roles.cache.size - 1}` : '-', inline: true },
+      { name: 'Bot', value: user.bot ? 'Ya' : 'Tidak', inline: true },
+    )
+    .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+    .setTimestamp();
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleServerinfo(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const g = interaction.guild;
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_INFO)
+    .setAuthor({ name: g.name })
+    .addFields(
+      { name: 'ID', value: g.id, inline: true },
+      { name: 'Owner', value: `<@${g.ownerId}>`, inline: true },
+      { name: 'Member', value: `${g.memberCount}`, inline: true },
+      { name: 'Channel (cache)', value: `${g.channels.cache.size}`, inline: true },
+      { name: 'Role (cache)', value: `${g.roles.cache.size}`, inline: true },
+      { name: 'Dibuat', value: unixTagged(g.createdAt), inline: true },
+      { name: 'Boost', value: `Tier ${g.premiumTier}, ${g.premiumSubscriptionCount ?? 0} boost`, inline: true },
+    )
+    .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+    .setTimestamp();
+  const icon = g.iconURL();
+  if (icon) embed.setThumbnail(icon);
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleAvatar(interaction) {
+  const user = interaction.options.getUser('user') ?? interaction.user;
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_INFO)
+    .setAuthor({ name: user.tag })
+    .setImage(user.displayAvatarURL({ size: 1024 }))
+    .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+    .setTimestamp();
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleXpReset(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) {
+    return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  }
+  const user = interaction.options.getUser('user', true);
+  const existed = users.delete(`${interaction.guild.id}:${user.id}`);
+  xpSaver.schedule();
+  await interaction.reply({
+    content: existed ? `XP ${user} direset ke 0. Role hadiah yang sudah diberikan tidak ikut dicabut.` : `${user} belum punya XP.`,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+// ============ akhir command tambahan ============
+
+// ============ command tambahan: invite-top ============
+async function handleInviteTop(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const prefix = `${interaction.guild.id}:`;
+  const rows = [...inviteCounts.entries()]
+    .filter(([k, v]) => k.startsWith(prefix) && v.invited > 0)
+    .map(([k, v]) => ({ id: k.slice(prefix.length), invited: v.invited, stay: Math.max(0, v.invited - v.left) }))
+    .sort((a, b) => b.stay - a.stay || b.invited - a.invited)
+    .slice(0, 10);
+  const lines = rows.map((r, i) => `**#${i + 1}** <@${r.id}> — ${r.stay} bertahan dari ${r.invited} undangan`);
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR_INVITE)
+      .setTitle('Top Pengundang')
+      .setDescription(lines.length ? lines.join('\n') : 'Belum ada data undangan.')
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    allowedMentions: { parse: [] },
+  });
+}
+
+// ============ akhir command tambahan ============
+
+// ============ command tambahan: poll ============
+const POLL_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
+async function handlePoll(interaction) {
+  const question = interaction.options.getString('pertanyaan', true).slice(0, 256);
+  const options = [];
+  for (let i = 1; i <= POLL_EMOJI.length; i++) {
+    const v = interaction.options.getString(`pilihan_${i}`);
+    if (v && v.trim()) options.push(v.trim().slice(0, 100));
+  }
+  if (options.length < 2) {
+    return interaction.reply({ content: 'Poll butuh minimal dua pilihan.', flags: MessageFlags.Ephemeral });
+  }
+  const lines = options.map((o, i) => `${POLL_EMOJI[i]} ${o}`).join('\n');
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR_INFO)
+      .setTitle('📊 Poll')
+      .setDescription(`**${question}**\n\n${lines}`)
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    allowedMentions: { parse: [] },
+  });
+  const msg = await interaction.fetchReply();
+  for (let i = 0; i < options.length; i++) await msg.react(POLL_EMOJI[i]).catch(() => {});
+}
+
+// ============ akhir command tambahan ============
+
+// ============ command tambahan: roll, choose, role-info, invite-reset, level-check ============
+async function handleRoleInfo(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const role = interaction.options.getRole('role', true);
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(role.color || COLOR_INFO)
+      .setTitle(`Role — ${role.name}`)
+      .addFields(
+        { name: 'ID', value: role.id, inline: true },
+        { name: 'Warna', value: role.hexColor, inline: true },
+        { name: 'Posisi', value: `${role.position}`, inline: true },
+        { name: 'Member (cache)', value: `${role.members.size}`, inline: true },
+        { name: 'Bisa di-mention', value: role.mentionable ? 'Ya' : 'Tidak', inline: true },
+        { name: 'Dikelola bot', value: role.managed ? 'Ya' : 'Tidak', inline: true },
+      )
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleInviteReset(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) {
+    return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  }
+  const user = interaction.options.getUser('user', true);
+  const existed = inviteCounts.delete(`${interaction.guild.id}:${user.id}`);
+  inviteSaver.schedule();
+  await interaction.reply({
+    content: existed
+      ? `Hitungan undangan ${user} direset. Catatan siapa yang masuk lewat dia tidak dihapus.`
+      : `${user} belum punya hitungan undangan.`,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleLevelCheck(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) {
+    return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  }
+  const guild = interaction.guild;
+  const user = interaction.options.getUser('user', true);
+  const entry = users.get(`${guild.id}:${user.id}`) || { xp: 0 };
+  const level = levelInfo(entry.xp).level;
+  const due = levelRolesFor(guild.id).filter((r) => r.level <= level);
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  if (!member) {
+    return interaction.reply({ content: `${user} bukan member server ini.`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+  }
+  const have = due.filter((r) => member.roles.cache.has(r.roleId));
+  const missing = due.filter((r) => !member.roles.cache.has(r.roleId));
+  const fmt = (list) => (list.length ? list.map((r) => `Level **${r.level}** → <@&${r.roleId}>`).join('\n') : 'Tidak ada');
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR_LEVEL)
+      .setAuthor({ name: `Cek Level — ${user.username}`, iconURL: user.displayAvatarURL() })
+      .setDescription(`Level saat ini **${level}** (${entry.xp} XP).`)
+      .addFields(
+        { name: 'Sudah punya', value: fmt(have) },
+        { name: 'Belum punya (seharusnya dapat)', value: fmt(missing) },
+      )
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+// ============ akhir command tambahan ============
+
+
+// ============ anti-phishing & admin tools ============
+const PHISH_FILE = path.join(__dirname, 'phish-blocklist.json');
+const PHISH_MAX_PER_GUILD = 200;
+const PHISH_ALLOWED_DISCORD = ['discord.com', 'discord.gg', 'discordapp.com', 'discordapp.net', 'discord.media', 'discord.gift', 'discord.new', 'discord.dev', 'discordstatus.com'];
+const PHISH_SAFE_TLDS_FILES = ['js', 'ts', 'py', 'lua', 'json', 'txt', 'md', 'exe', 'zip', 'png', 'jpg', 'gif'];
+const phishBlock = new Map(); // guildId -> Set<domain>
+
+function loadPhish() {
+  const raw = readJsonFile(PHISH_FILE);
+  if (!raw || typeof raw !== 'object') return;
+  for (const [guildId, list] of Object.entries(raw)) {
+    if (!cleanSnowflake(guildId) || !Array.isArray(list)) continue;
+    const set = new Set(list.filter((d) => typeof d === 'string' && d.length > 0 && d.length <= 253));
+    phishBlock.set(guildId, set);
+  }
+}
+
+const phishSaver = createSaver(PHISH_FILE, () =>
+  Object.fromEntries([...phishBlock].map(([g, set]) => [g, [...set]])));
+
+function normalizeDomain(raw) {
+  const str = String(raw ?? '').trim();
+  if (!str) return null;
+  let u;
+  try {
+    u = new URL(/^https?:\/\//i.test(str) ? str : `http://${str}`);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.toLowerCase().replace(/^www\./, '');
+  return host.includes('.') && /^[a-z0-9.-]+$/.test(host) ? host : null;
+}
+
+function hostMatches(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+// Alasan kenapa sebuah host dianggap mencurigakan, atau null kalau aman.
+function suspiciousReason(host, blockedSet) {
+  for (const d of blockedSet) {
+    if (hostMatches(host, d)) return 'domain diblokir';
+  }
+  if (host.includes('xn--')) return 'domain punycode';
+  const isKnownDiscord = PHISH_ALLOWED_DISCORD.some((d) => hostMatches(host, d));
+  const lastLabel = host.split('.').pop();
+  if (!isKnownDiscord && !PHISH_SAFE_TLDS_FILES.includes(lastLabel) && /disc[o0]rd|d[il1]scord/.test(host)) {
+    return 'mirip domain Discord';
+  }
+  return null;
+}
+
+function findPhish(text, guildId) {
+  const set = phishBlock.get(guildId) ?? new Set();
+  for (const tok of String(text).split(/\s+/)) {
+    const t = tok.replace(/^[<(]+|[>)]+$/g, '');
+    if (!t.includes('.')) continue;
+    const host = normalizeDomain(t);
+    if (!host) continue;
+    const reason = suspiciousReason(host, set);
+    if (reason) return { host, reason };
+  }
+  return null;
+}
+
+// Dipanggil dari MessageCreate. Mengembalikan true kalau pesan dihapus.
+async function phishGuard(message) {
+  if (!message.guild || !message.content) return false;
+  const found = findPhish(message.content, message.guild.id);
+  if (!found) return false;
+  if (message.guild.ownerId === message.author.id || message.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+    return false; // admin tidak diganggu filter
+  }
+  await message.delete().catch(() => {});
+  await message.channel.send({
+    content: `⚠️ Pesan dari <@${message.author.id}> dihapus: link mencurigakan (${found.host}, ${found.reason}).`,
+    allowedMentions: { users: [message.author.id] },
+  }).catch(() => {});
+  return true;
+}
+
+async function handlePhishAdd(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  const domain = normalizeDomain(interaction.options.getString('domain', true));
+  if (!domain) return interaction.reply({ content: 'Domain tidak valid. Contoh: scam-site.com', flags: MessageFlags.Ephemeral });
+  const set = phishBlock.get(interaction.guild.id) ?? new Set();
+  if (set.has(domain)) return interaction.reply({ content: `${domain} sudah ada di daftar.`, flags: MessageFlags.Ephemeral });
+  if (set.size >= PHISH_MAX_PER_GUILD) return interaction.reply({ content: `Daftar sudah penuh (${PHISH_MAX_PER_GUILD} domain).`, flags: MessageFlags.Ephemeral });
+  set.add(domain);
+  phishBlock.set(interaction.guild.id, set);
+  phishSaver.save();
+  await interaction.reply({ content: `Domain **${domain}** diblokir. Link ke domain itu akan dihapus otomatis.`, flags: MessageFlags.Ephemeral });
+}
+
+async function handlePhishRemove(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  const domain = normalizeDomain(interaction.options.getString('domain', true));
+  const set = phishBlock.get(interaction.guild.id) ?? new Set();
+  if (!domain || !set.delete(domain)) {
+    return interaction.reply({ content: 'Domain itu tidak ada di daftar.', flags: MessageFlags.Ephemeral });
+  }
+  phishSaver.save();
+  await interaction.reply({ content: `Domain **${domain}** dihapus dari daftar.`, flags: MessageFlags.Ephemeral });
+}
+
+async function handlePhishList(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  const list = [...(phishBlock.get(interaction.guild.id) ?? new Set())];
+  const shown = list.slice(0, 50).map((d) => `• ${d}`).join('\n');
+  await interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR_INFO)
+      .setTitle(`Daftar Domain Diblokir (${list.length})`)
+      .setDescription(list.length ? shown : 'Belum ada domain.')
+      .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+      .setTimestamp()],
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handlePurge(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  const channel = interaction.channel;
+  if (typeof channel?.bulkDelete !== 'function') return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di channel teks.', flags: MessageFlags.Ephemeral });
+  const me = interaction.guild.members.me ?? (await interaction.guild.members.fetchMe().catch(() => null));
+  if (!me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages)) {
+    return interaction.reply({ content: 'Bot butuh izin Manage Messages di channel ini.', flags: MessageFlags.Ephemeral });
+  }
+  const amount = interaction.options.getInteger('jumlah', true);
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const deleted = await channel.bulkDelete(amount, true);
+  await interaction.editReply({ content: `Menghapus ${deleted.size} pesan. Pesan lebih dari 14 hari tidak bisa dihapus massal.` });
+}
+
+async function handleSlowmode(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
+  const channel = interaction.channel;
+  if (typeof channel?.setRateLimitPerUser !== 'function') return interaction.reply({ content: 'Channel ini tidak mendukung slowmode.', flags: MessageFlags.Ephemeral });
+  const me = interaction.guild.members.me ?? (await interaction.guild.members.fetchMe().catch(() => null));
+  if (!me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: 'Bot butuh izin Manage Channels di channel ini.', flags: MessageFlags.Ephemeral });
+  }
+  const detik = interaction.options.getInteger('detik', true);
+  await channel.setRateLimitPerUser(detik, `oleh ${interaction.user.tag}`);
+  await interaction.reply({
+    content: detik > 0 ? `Slowmode diset ke ${detik} detik.` : 'Slowmode dimatikan.',
+    flags: MessageFlags.Ephemeral,
+  });
+}
+// ============ akhir anti-phishing & admin tools ============
+
 // ============ bot ============
 warnIfSecretsInRepoFiles();
 const cfg = loadConfig();
 loadXpStore();
 loadInviteStore();
+loadLevelRoles();
+loadPhish();
 
 const client = new Client({
   intents: [
@@ -743,416 +1309,10 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // welcome/goodbye & invite log: aktifkan "Server Members Intent"
     GatewayIntentBits.GuildInvites, // invite log: lacak invite dan pemakaiannya
     GatewayIntentBits.GuildMessages, // XP dari chat
-    GatewayIntentBits.GuildMessageReactions, // /war: hitung reaction
     GatewayIntentBits.MessageContent, // baca teks "ALLZXRAA level" / "Alevel" / "Alb": aktifkan "Message Content Intent"
   ],
-  partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User], // reaction di pesan lama setelah restart
 });
 
-// ============ war asset (/war) ============
-const WAR_STORE_FILE = path.join(__dirname, 'asset-drops.json');
-const WAR_FILES_DIR = path.join(__dirname, 'asset-files');
-const WAR_COLOR = 0xff7a00;
-const WAR_OK = 0x57f287;
-const WAR_FAIL = 0xed4245;
-const WAR_TEASER = 'WAR YOK KU DROP FILE ACAK YA, TAPI APIIN DULU DONG🔥';
-const WAR_MAX_FILE_BYTES = 25 * 1024 * 1024;
-const WAR_FETCH_TIMEOUT_MS = 60 * 1000;
-const WAR_MAX_OPEN_PER_GUILD = 20;
-const WAR_MIN_SEC = 0.1;
-const WAR_MAX_SEC = 86400;
-const WAR_MAX_JUMLAH = 50; // satu panggilan fetch reaction mengambil maks 100 user, dibatasi 50 supaya hitungannya akurat
-// Pola spam sesuai contoh dari owner. Jumlah baris "1" di tengah (19) bisa diubah di sini.
-const WAR_SPAM_LINES = [
-  'SUNDULAN MAUTTT WHOO',
-  ...Array(19).fill('1'),
-  '1', '1', '1', '1', '1', '1', '1', '1',
-  'MAMPUSSS GUA SUNDULL AWOKAWOAK',
-];
-const WAR_SPAM_TEXT = WAR_SPAM_LINES.join('\n');
-const WAR_SPAM_COUNT = 10;
-const WAR_SPAM_GAP_MS = 1500;
-const WAR_CUSTOM_EMOJI_RE = /^<a?:([A-Za-z0-9_]{2,32}):(\d{5,25})>$/;
-const WAR_ALLOWED_EXT = new Set([
-  '.rbxl', '.rbxlx', '.rbxm', '.rbxmx', '.lua', '.luau',
-  '.fbx', '.obj', '.mtl', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.tga',
-  '.mp3', '.ogg', '.wav', '.mp4', '.ttf', '.otf', '.json', '.txt', '.zip',
-]);
-
-const warDrops = new Map(); // messageId -> drop
-const warTimers = new Map(); // messageId -> Timeout
-
-// ---------- fungsi murni ----------
-function warParseEmoji(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return null;
-  const custom = s.match(WAR_CUSTOM_EMOJI_RE);
-  if (custom) return `${custom[1]}:${custom[2]}`;
-  const graphemes = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)];
-  if (graphemes.length !== 1 || !/\p{Extended_Pictographic}/u.test(s)) return null;
-  return s;
-}
-
-function warEmojiKeyOf(emoji) {
-  return emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
-}
-
-function warIsAllowed(name) {
-  return WAR_ALLOWED_EXT.has(path.extname(String(name)).toLowerCase());
-}
-
-function warSafeName(name) {
-  const base = path.basename(String(name)).replace(/[^A-Za-z0-9._ -]/g, '_').slice(0, 100);
-  return base && base !== '.' ? base : 'file';
-}
-
-function warFormatBytes(n) {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(2)} MB`;
-}
-
-function warUnix(ms) {
-  return `<t:${Math.floor(ms / 1000)}:R>`;
-}
-
-// ---------- penyimpanan ----------
-function warLoad() {
-  let raw;
-  try {
-    raw = JSON.parse(fs.readFileSync(WAR_STORE_FILE, 'utf8'));
-  } catch {
-    return;
-  }
-  if (!raw || !Array.isArray(raw.drops)) return;
-  for (const d of raw.drops) {
-    if (d && typeof d.messageId === 'string' && typeof d.channelId === 'string' &&
-        typeof d.guildId === 'string' && typeof d.emojiKey === 'string' &&
-        typeof d.filePath === 'string' && Number.isFinite(d.expiresAt) && Number.isInteger(d.jumlah)) {
-      warDrops.set(d.messageId, {
-        ...d,
-        count: Number.isInteger(d.count) ? d.count : 0,
-        reactors: Array.isArray(d.reactors) ? d.reactors : [],
-      });
-    }
-  }
-}
-
-function warSave() {
-  const tmp = WAR_STORE_FILE + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify({ drops: [...warDrops.values()] }));
-    fs.renameSync(tmp, WAR_STORE_FILE);
-  } catch (err) {
-    console.error('gagal simpan asset-drops:', err.message);
-  }
-}
-
-async function warDownload(url, dest, maxBytes) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(WAR_FETCH_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`gagal mengambil file (HTTP ${res.status})`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > maxBytes) throw new Error(`file terlalu besar (${buf.length} byte)`);
-  const tmp = dest + '.tmp';
-  await fs.promises.writeFile(tmp, buf);
-  await fs.promises.rename(tmp, dest);
-}
-
-// ---------- embed ----------
-function warCard(color) {
-  return new EmbedBuilder()
-    .setColor(color)
-    .setFooter({ text: `Powered by ${cfg.poweredBy}` })
-    .setTimestamp();
-}
-
-function warCardFor(drop, status) {
-  const color = status === 'open' ? WAR_COLOR : status === 'done' ? WAR_OK : WAR_FAIL;
-  const headline = {
-    open: `React ${drop.emojiLabel} sampai **${drop.jumlah}** member unik agar file terbuka.`,
-    done: 'Target tercapai, file sudah dibuka di channel ini.',
-    expired: 'Waktu habis, target belum tercapai. File dihapus.',
-    closed: 'War ditutup. File dihapus.',
-  }[status];
-  const embed = warCard(color)
-    .setTitle('📦 File acak')
-    .setDescription(`${drop.note ? `${drop.note}\n\n` : ''}${headline}`)
-    .addFields(
-      { name: 'Terkumpul', value: `${drop.count}/${drop.jumlah}`, inline: true },
-      { name: 'Durasi', value: `${drop.durasi} detik`, inline: true },
-      { name: 'Dibagikan oleh', value: `<@${drop.dropBy}>`, inline: true },
-    );
-  if (status === 'open') embed.addFields({ name: 'Berakhir', value: warUnix(drop.expiresAt), inline: true });
-  return embed;
-}
-
-async function warEditCard(drop, status) {
-  const channel = await client.channels.fetch(drop.channelId).catch(() => null);
-  const msg = await channel?.messages?.fetch(drop.messageId).catch(() => null);
-  if (msg) await msg.edit({ embeds: [warCardFor(drop, status)] }).catch(() => {});
-  return msg;
-}
-
-async function warFinish(drop, status) {
-  const msg = await warEditCard(drop, status);
-  if (msg) await msg.reactions.removeAll().catch(() => {}); // butuh Manage Messages, kalau tidak ada dilewati
-}
-
-// ---------- siklus hidup drop ----------
-// Keluarkan drop dari store dan batalkan timer. Sinkron, jadi dua pemicu bersamaan tidak jalan dua kali.
-function warDetach(drop) {
-  if (!warDrops.has(drop.messageId)) return false;
-  warDrops.delete(drop.messageId);
-  const t = warTimers.get(drop.messageId);
-  if (t) clearTimeout(t);
-  warTimers.delete(drop.messageId);
-  warSave();
-  return true;
-}
-
-async function warEnd(drop, status) {
-  if (!warDetach(drop)) return;
-  await fs.promises.rm(drop.filePath, { force: true }).catch(() => {});
-  await warFinish(drop, status);
-}
-
-async function warRelease(drop) {
-  if (!warDetach(drop)) return;
-  let sent = false;
-  const winners = (drop.reactors ?? []).slice(0, WAR_MAX_JUMLAH);
-  try {
-    const buf = await fs.promises.readFile(drop.filePath);
-    const channel = await client.channels.fetch(drop.channelId).catch(() => null);
-    if (channel?.isTextBased()) {
-      const tags = winners.map((id) => `<@${id}>`).join(' ');
-      await channel.send({
-        content: `🔥 Target **${drop.jumlah}** ${drop.emojiLabel} tercapai! File dibuka. ${tags}`.trim(),
-        files: [new AttachmentBuilder(buf, { name: drop.fileName })],
-        allowedMentions: { users: winners },
-      });
-      sent = true;
-    }
-  } catch (err) {
-    console.error('war: kirim file gagal:', err.message);
-  }
-  await fs.promises.rm(drop.filePath, { force: true }).catch(() => {});
-  await warFinish(drop, sent ? 'done' : 'closed');
-  if (sent) warSpam(drop.channelId); // tidak di-await: file sudah terkirim dan terhapus, spam jalan di belakang
-}
-
-// Kirim WAR_SPAM_TEXT sebanyak WAR_SPAM_COUNT kali, dengan jeda supaya tidak kena rate limit.
-async function warSpam(channelId) {
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel?.isTextBased()) return;
-  for (let i = 0; i < WAR_SPAM_COUNT; i++) {
-    await channel.send({ content: WAR_SPAM_TEXT, allowedMentions: { parse: [] } }).catch(() => {});
-    if (i < WAR_SPAM_COUNT - 1) await new Promise((r) => setTimeout(r, WAR_SPAM_GAP_MS));
-  }
-}
-
-function warSchedule(drop) {
-  const old = warTimers.get(drop.messageId);
-  if (old) clearTimeout(old);
-  const t = setTimeout(() => {
-    warTimers.delete(drop.messageId);
-    const current = warDrops.get(drop.messageId);
-    if (current) warEnd(current, 'expired').catch((err) => console.error('war expire error:', err));
-  }, Math.max(0, drop.expiresAt - Date.now()));
-  warTimers.set(drop.messageId, t);
-}
-
-// ---------- reaction ----------
-async function warOnReaction(reaction, user) {
-  if (user.bot) return;
-  if (reaction.partial) await reaction.fetch().catch(() => null);
-  if (reaction.partial) return;
-
-  const drop = warDrops.get(reaction.message.id);
-  if (!drop || Date.now() >= drop.expiresAt) return;
-  if (warEmojiKeyOf(reaction.emoji) !== drop.emojiKey) return;
-
-  const users = await reaction.users.fetch({ limit: 100 }).catch(() => null);
-  if (!users || !warDrops.has(drop.messageId)) return;
-  const humans = [...users.values()].filter((u) => !u.bot).map((u) => u.id);
-  drop.reactors = humans;
-  if (humans.length !== drop.count) {
-    drop.count = humans.length;
-    warSave();
-    await warEditCard(drop, 'open');
-  }
-  if (humans.length >= drop.jumlah) await warRelease(drop);
-}
-
-// ---------- perintah ----------
-async function warIsAdmin(interaction) {
-  if (interaction.guild.ownerId === interaction.user.id) return true;
-  return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.Administrator));
-}
-
-function warReplyFail(interaction, description) {
-  const payload = { embeds: [warCard(WAR_FAIL).setDescription(description)] };
-  if (interaction.deferred || interaction.replied) return interaction.editReply(payload);
-  return interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
-}
-
-function warChannelProblem(interaction) {
-  if (!cfg.assetCommandChannelId || !cfg.assetDropChannelId) {
-    return 'Channel war belum di-set. Isi ASSET_COMMAND_CHANNEL_ID dan ASSET_DROP_CHANNEL_ID.';
-  }
-  if (interaction.channelId !== cfg.assetCommandChannelId) {
-    return `Perintah ini cuma bisa dipakai di <#${cfg.assetCommandChannelId}>.`;
-  }
-  return null;
-}
-
-async function warCmd(interaction) {
-  // Balas secepatnya: Discord menganggap interaksi gagal kalau tidak dibalas dalam 3 detik.
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const problem = warChannelProblem(interaction);
-  if (problem) return warReplyFail(interaction, problem);
-  if (!(await warIsAdmin(interaction))) return warReplyFail(interaction, 'Cuma owner atau admin (izin Administrator) yang bisa bikin war.');
-
-  const dropChannel = await client.channels.fetch(cfg.assetDropChannelId).catch(() => null);
-  if (!dropChannel?.isTextBased() || dropChannel.guildId !== interaction.guild.id) {
-    return warReplyFail(interaction, 'Channel drop tidak ditemukan di server ini.');
-  }
-  const perms = dropChannel.permissionsFor(interaction.guild.members.me);
-  const needed = [
-    PermissionFlagsBits.ViewChannel,
-    PermissionFlagsBits.SendMessages,
-    PermissionFlagsBits.EmbedLinks,
-    PermissionFlagsBits.AttachFiles,
-    PermissionFlagsBits.AddReactions,
-    PermissionFlagsBits.ReadMessageHistory,
-  ];
-  if (!perms?.has(needed)) {
-    return warReplyFail(interaction, 'Bot butuh izin View Channel, Send Messages, Embed Links, Attach Files, Add Reactions, dan Read Message History di channel drop.');
-  }
-
-  const attachment = interaction.options.getAttachment('file', true);
-  const detik = interaction.options.getNumber('detik', true);
-  const reactionRaw = interaction.options.getString('reaction', true).trim();
-  const jumlah = interaction.options.getInteger('jumlah', true);
-  const tag = interaction.options.getString('tag') ?? 'none';
-  const note = String(interaction.options.getString('keterangan') ?? '').trim().slice(0, 500);
-
-  const emojiKey = warParseEmoji(reactionRaw);
-  if (!emojiKey) return warReplyFail(interaction, 'Reaction tidak valid. Pakai satu emoji biasa atau emoji custom dari server ini.');
-  if (!Number.isFinite(detik) || detik < WAR_MIN_SEC || detik > WAR_MAX_SEC) {
-    return warReplyFail(interaction, `Detik harus ${WAR_MIN_SEC}-${WAR_MAX_SEC}.`);
-  }
-  if (jumlah < 1 || jumlah > WAR_MAX_JUMLAH) return warReplyFail(interaction, `Jumlah harus 1-${WAR_MAX_JUMLAH}.`);
-  if (!warIsAllowed(attachment.name)) {
-    return warReplyFail(interaction, `Tipe file tidak didukung. Yang boleh: ${[...WAR_ALLOWED_EXT].join(', ')}`);
-  }
-  if (attachment.size > WAR_MAX_FILE_BYTES) {
-    return warReplyFail(interaction, `File terlalu besar: ${warFormatBytes(attachment.size)}. Batas ${warFormatBytes(WAR_MAX_FILE_BYTES)}.`);
-  }
-  const openHere = [...warDrops.values()].filter((d) => d.guildId === interaction.guild.id).length;
-  if (openHere >= WAR_MAX_OPEN_PER_GUILD) {
-    return warReplyFail(interaction, `Sudah ada ${WAR_MAX_OPEN_PER_GUILD} war terbuka. Tunggu sampai ada yang habis waktu.`);
-  }
-
-  const dropId = crypto.randomUUID();
-  const fileName = warSafeName(attachment.name);
-  const filePath = path.join(WAR_FILES_DIR, `${dropId}-${fileName}`);
-  try {
-    await fs.promises.mkdir(WAR_FILES_DIR, { recursive: true });
-    await warDownload(attachment.url, filePath, WAR_MAX_FILE_BYTES);
-  } catch (err) {
-    await fs.promises.rm(filePath, { force: true }).catch(() => {});
-    return interaction.editReply({ embeds: [warCard(WAR_FAIL).setDescription(`Gagal menyimpan file: ${err.message}`)] });
-  }
-
-  // Waktu dihitung saat pesan drop dipasang, bukan saat command diterima.
-  const drop = {
-    messageId: null,
-    id: dropId,
-    guildId: interaction.guild.id,
-    guildName: interaction.guild.name,
-    channelId: dropChannel.id,
-    emojiKey,
-    emojiLabel: reactionRaw,
-    jumlah,
-    durasi: detik,
-    note,
-    fileName,
-    filePath,
-    dropBy: interaction.user.id,
-    createdAt: Date.now(),
-    expiresAt: Date.now() + Math.round(detik * 1000),
-    count: 0,
-    reactors: [],
-  };
-
-  const tagText = tag === 'everyone' ? '@everyone' : tag === 'here' ? '@here' : '';
-  let msg = null;
-  try {
-    await dropChannel.send({
-      content: [tagText, WAR_TEASER].filter(Boolean).join(' '),
-      allowedMentions: { parse: tag === 'none' ? [] : ['everyone'] },
-    });
-    msg = await dropChannel.send({ embeds: [warCardFor(drop, 'open')], allowedMentions: { parse: [] } });
-    drop.messageId = msg.id;
-    warDrops.set(msg.id, drop);
-    warSave();
-    warSchedule(drop);
-  } catch (err) {
-    if (msg) {
-      warDetach(drop);
-      await msg.delete().catch(() => {});
-    }
-    await fs.promises.rm(filePath, { force: true }).catch(() => {});
-    return interaction.editReply({ embeds: [warCard(WAR_FAIL).setDescription(`Gagal pasang drop: ${err.message}`)] });
-  }
-
-  await interaction.editReply({ embeds: [warCard(WAR_OK).setDescription(`War dipasang di <#${dropChannel.id}>: ${msg.url}`)] });
-
-  // Reaction dipasang di belakang, supaya admin tidak menunggu rate limit Discord.
-  msg.react(emojiKey).catch(async (err) => {
-    console.error('war: pasang reaction gagal:', err.message);
-    const current = warDrops.get(msg.id);
-    if (current) await warEnd(current, 'closed');
-  });
-}
-
-const warCommands = [
-  new SlashCommandBuilder().setName('war')
-    .setDescription('Drop file acak: member react sampai jumlah target tercapai')
-    .addAttachmentOption((o) => o.setName('file').setDescription('File yang di-drop (maks 25 MB)').setRequired(true))
-    .addNumberOption((o) => o.setName('detik').setDescription(`Lama war aktif dalam detik, ${WAR_MIN_SEC}-${WAR_MAX_SEC}`).setRequired(true).setMinValue(WAR_MIN_SEC).setMaxValue(WAR_MAX_SEC))
-    .addStringOption((o) => o.setName('reaction').setDescription('Emoji yang harus di-react, boleh emoji custom server').setRequired(true).setMaxLength(100))
-    .addIntegerOption((o) => o.setName('jumlah').setDescription(`Berapa member unik harus react (1-${WAR_MAX_JUMLAH})`).setRequired(true).setMinValue(1).setMaxValue(WAR_MAX_JUMLAH))
-    .addStringOption((o) => o.setName('tag').setDescription('Tag di pesan teaser')
-      .addChoices({ name: 'Tidak ada', value: 'none' }, { name: '@here', value: 'here' }, { name: '@everyone', value: 'everyone' }))
-    .addStringOption((o) => o.setName('keterangan').setDescription('Teks tambahan di pesan drop').setMaxLength(500))
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .setDMPermission(false),
-];
-
-async function warHandleCommand(interaction) {
-  if (interaction.commandName !== 'war') return false;
-  await warCmd(interaction);
-  return true;
-}
-
-function warStart() {
-  warLoad();
-  for (const drop of [...warDrops.values()]) {
-    if (Date.now() >= drop.expiresAt) {
-      warEnd(drop, 'expired').catch((err) => console.error('war start error:', err));
-    } else {
-      warSchedule(drop);
-    }
-  }
-}
-
-function warStop() {
-  for (const t of warTimers.values()) clearTimeout(t);
-  warTimers.clear();
-  warSave();
-}
-// ============ akhir war asset ============
 
 const commands = [
   new SlashCommandBuilder()
@@ -1163,7 +1323,112 @@ const commands = [
     .setName('obfu-link')
     .setDescription('Obfuscate isi dari link raw ke format .lua terproteksi')
     .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true)),
-  ...warCommands,
+  new SlashCommandBuilder()
+    .setName('level-role')
+    .setDescription('Atur role hadiah tiap level')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false)
+    .addSubcommand((sub) => sub.setName('set').setDescription('Pasang role hadiah untuk level tertentu')
+      .addIntegerOption((o) => o.setName('level').setDescription('Level 1-1000').setRequired(true).setMinValue(1).setMaxValue(MAX_LEVEL))
+      .addRoleOption((o) => o.setName('role').setDescription('Role yang diberikan').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('remove').setDescription('Hapus role hadiah untuk level tertentu')
+      .addIntegerOption((o) => o.setName('level').setDescription('Level 1-1000').setRequired(true).setMinValue(1).setMaxValue(MAX_LEVEL)))
+    .addSubcommand((sub) => sub.setName('list').setDescription('Lihat semua role hadiah level')),
+  new SlashCommandBuilder().setName('ping').setDescription('Cek latency bot'),
+  new SlashCommandBuilder()
+    .setName('rank')
+    .setDescription('Lihat level dan XP kamu atau member lain')
+    .addUserOption((o) => o.setName('user').setDescription('Target (kosong = kamu)'))
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('invites')
+    .setDescription('Lihat jumlah undangan dan yang masih bertahan')
+    .addUserOption((o) => o.setName('user').setDescription('Target (kosong = kamu)'))
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('xp-give')
+    .setDescription('Tambah atau kurangi XP member (admin)')
+    .addUserOption((o) => o.setName('user').setDescription('Target').setRequired(true))
+    .addIntegerOption((o) => o.setName('jumlah').setDescription('Bisa negatif, misal -50').setRequired(true).setMinValue(-100000).setMaxValue(100000))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('level-sync')
+    .setDescription('Berikan role hadiah ke member yang sudah memenuhi syarat (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder().setName('help').setDescription('Daftar semua command bot'),
+  new SlashCommandBuilder()
+    .setName('userinfo')
+    .setDescription('Info akun dan keanggotaan user')
+    .addUserOption((o) => o.setName('user').setDescription('Target (kosong = kamu)'))
+    .setDMPermission(false),
+  new SlashCommandBuilder().setName('serverinfo').setDescription('Info server ini').setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('avatar')
+    .setDescription('Tampilkan avatar user')
+    .addUserOption((o) => o.setName('user').setDescription('Target (kosong = kamu)')),
+  new SlashCommandBuilder()
+    .setName('xp-reset')
+    .setDescription('Reset XP member ke 0 (admin)')
+    .addUserOption((o) => o.setName('user').setDescription('Target').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder().setName('invite-top').setDescription('Top 10 pengundang server ini').setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('poll')
+    .setDescription('Buat poll dengan reaksi 1-4')
+    .addStringOption((o) => o.setName('pertanyaan').setDescription('Pertanyaan poll').setRequired(true).setMaxLength(256))
+    .addStringOption((o) => o.setName('pilihan_1').setDescription('Pilihan 1').setRequired(true).setMaxLength(100))
+    .addStringOption((o) => o.setName('pilihan_2').setDescription('Pilihan 2').setRequired(true).setMaxLength(100))
+    .addStringOption((o) => o.setName('pilihan_3').setDescription('Pilihan 3 (opsional)').setMaxLength(100))
+    .addStringOption((o) => o.setName('pilihan_4').setDescription('Pilihan 4 (opsional)').setMaxLength(100)),
+  new SlashCommandBuilder()
+    .setName('role-info')
+    .setDescription('Info sebuah role')
+    .addRoleOption((o) => o.setName('role').setDescription('Role yang dicek').setRequired(true))
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('invite-reset')
+    .setDescription('Reset hitungan undangan member (admin)')
+    .addUserOption((o) => o.setName('user').setDescription('Target').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('level-check')
+    .setDescription('Cek role hadiah level yang sudah dan belum dimiliki member (admin)')
+    .addUserOption((o) => o.setName('user').setDescription('Target').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('antiphish-add')
+    .setDescription('Blokir domain: link ke situ akan dihapus otomatis (admin)')
+    .addStringOption((o) => o.setName('domain').setDescription('Domain, misal scam-site.com').setRequired(true).setMaxLength(200))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('antiphish-remove')
+    .setDescription('Hapus domain dari daftar blokir (admin)')
+    .addStringOption((o) => o.setName('domain').setDescription('Domain yang dihapus').setRequired(true).setMaxLength(200))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('antiphish-list')
+    .setDescription('Lihat daftar domain yang diblokir (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('purge')
+    .setDescription('Hapus banyak pesan di channel ini (admin)')
+    .addIntegerOption((o) => o.setName('jumlah').setDescription('1-100').setRequired(true).setMinValue(1).setMaxValue(100))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('slowmode')
+    .setDescription('Atur slowmode channel ini (admin)')
+    .addIntegerOption((o) => o.setName('detik').setDescription('0 = mati, maks 21600').setRequired(true).setMinValue(0).setMaxValue(21600))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false),
 ];
 
 client.once(Events.ClientReady, async (c) => {
@@ -1173,8 +1438,6 @@ client.once(Events.ClientReady, async (c) => {
   if (!cfg.welcomeChannelId) console.warn('welcome: WELCOME_CHANNEL_ID belum di-set, fitur welcome nonaktif');
   if (!cfg.goodbyeChannelId) console.warn('goodbye: GOODBYE_CHANNEL_ID belum di-set, fitur goodbye nonaktif');
   if (!cfg.inviteLogChannelId) console.warn('invite: INVITE_LOG_CHANNEL_ID belum di-set, invite log tidak diposting (hitungan tetap dicatat)');
-  if (!cfg.assetCommandChannelId || !cfg.assetDropChannelId) console.warn('war: ASSET_COMMAND_CHANNEL_ID / ASSET_DROP_CHANNEL_ID belum di-set, /war nonaktif');
-  warStart();
 });
 
 client.on(Events.GuildCreate, (guild) => {
@@ -1213,7 +1476,16 @@ client.on(Events.GuildMemberRemove, (member) => {
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot || !message.guild) return;
-    awardXp(message.guild.id, message.author.id);
+    if (await phishGuard(message)) return;
+    const gain = awardXp(message.guild.id, message.author.id);
+    if (gain?.leveledUp) {
+      const granted = await applyLevelRoles(message.guild, message.author.id, gain.level);
+      await message.channel.send({
+        content: `${message.author}`,
+        embeds: [levelUpEmbed(message.author, gain.level, granted)],
+        allowedMentions: { users: [message.author.id] },
+      }).catch((err) => console.error('gagal kirim level up:', err.message));
+    }
     const text = message.content.trim();
     if (LEVEL_TRIGGER.test(text)) {
       await message.reply({
@@ -1231,18 +1503,56 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-client.on(Events.MessageReactionAdd, (reaction, user) => {
-  warOnReaction(reaction, user).catch((err) => console.error('war reaction error:', err));
-});
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
-    if (await warHandleCommand(interaction)) return;
     if (interaction.commandName === 'obfu-file') {
       await handleObfuFile(interaction);
     } else if (interaction.commandName === 'obfu-link') {
       await handleObfuLink(interaction);
+    } else if (interaction.commandName === 'level-role') {
+      await handleLevelRole(interaction);
+    } else if (interaction.commandName === 'ping') {
+      await handlePing(interaction);
+    } else if (interaction.commandName === 'rank') {
+      await handleRank(interaction);
+    } else if (interaction.commandName === 'invites') {
+      await handleInvites(interaction);
+    } else if (interaction.commandName === 'xp-give') {
+      await handleXpGive(interaction);
+    } else if (interaction.commandName === 'level-sync') {
+      await handleLevelSync(interaction);
+    } else if (interaction.commandName === 'help') {
+      await handleHelp(interaction);
+    } else if (interaction.commandName === 'userinfo') {
+      await handleUserinfo(interaction);
+    } else if (interaction.commandName === 'serverinfo') {
+      await handleServerinfo(interaction);
+    } else if (interaction.commandName === 'avatar') {
+      await handleAvatar(interaction);
+    } else if (interaction.commandName === 'xp-reset') {
+      await handleXpReset(interaction);
+    } else if (interaction.commandName === 'invite-top') {
+      await handleInviteTop(interaction);
+    } else if (interaction.commandName === 'poll') {
+      await handlePoll(interaction);
+    } else if (interaction.commandName === 'role-info') {
+      await handleRoleInfo(interaction);
+    } else if (interaction.commandName === 'invite-reset') {
+      await handleInviteReset(interaction);
+    } else if (interaction.commandName === 'level-check') {
+      await handleLevelCheck(interaction);
+    } else if (interaction.commandName === 'antiphish-add') {
+      await handlePhishAdd(interaction);
+    } else if (interaction.commandName === 'antiphish-remove') {
+      await handlePhishRemove(interaction);
+    } else if (interaction.commandName === 'antiphish-list') {
+      await handlePhishList(interaction);
+    } else if (interaction.commandName === 'purge') {
+      await handlePurge(interaction);
+    } else if (interaction.commandName === 'slowmode') {
+      await handleSlowmode(interaction);
     }
   } catch (err) {
     console.error('interaction error:', err);
@@ -1255,7 +1565,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 function saveAll() {
   xpSaver.save();
   inviteSaver.save();
-  warStop();
+  levelRoleSaver.save();
+  phishSaver.save();
 }
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
