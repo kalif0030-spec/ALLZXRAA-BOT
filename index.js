@@ -771,7 +771,7 @@ const WAR_SPAM_LINES = [
 ];
 const WAR_SPAM_TEXT = WAR_SPAM_LINES.join('\n');
 const WAR_SPAM_COUNT = 10;
-const WAR_SPAM_GAP_MS = 1000;
+const WAR_SPAM_GAP_MS = 1500;
 const WAR_CUSTOM_EMOJI_RE = /^<a?:([A-Za-z0-9_]{2,32}):(\d{5,25})>$/;
 const WAR_ALLOWED_EXT = new Set([
   '.rbxl', '.rbxlx', '.rbxm', '.rbxmx', '.lua', '.luau',
@@ -990,7 +990,9 @@ async function warIsAdmin(interaction) {
 }
 
 function warReplyFail(interaction, description) {
-  return interaction.reply({ embeds: [warCard(WAR_FAIL).setDescription(description)], flags: MessageFlags.Ephemeral });
+  const payload = { embeds: [warCard(WAR_FAIL).setDescription(description)] };
+  if (interaction.deferred || interaction.replied) return interaction.editReply(payload);
+  return interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
 }
 
 function warChannelProblem(interaction) {
@@ -1004,6 +1006,8 @@ function warChannelProblem(interaction) {
 }
 
 async function warCmd(interaction) {
+  // Balas secepatnya: Discord menganggap interaksi gagal kalau tidak dibalas dalam 3 detik.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const problem = warChannelProblem(interaction);
   if (problem) return warReplyFail(interaction, problem);
   if (!(await warIsAdmin(interaction))) return warReplyFail(interaction, 'Cuma owner atau admin (izin Administrator) yang bisa bikin war.');
@@ -1049,8 +1053,6 @@ async function warCmd(interaction) {
     return warReplyFail(interaction, `Sudah ada ${WAR_MAX_OPEN_PER_GUILD} war terbuka. Tunggu sampai ada yang habis waktu.`);
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
   const dropId = crypto.randomUUID();
   const fileName = warSafeName(attachment.name);
   const filePath = path.join(WAR_FILES_DIR, `${dropId}-${fileName}`);
@@ -1095,7 +1097,6 @@ async function warCmd(interaction) {
     warDrops.set(msg.id, drop);
     warSave();
     warSchedule(drop);
-    await msg.react(emojiKey);
   } catch (err) {
     if (msg) {
       warDetach(drop);
@@ -1106,6 +1107,13 @@ async function warCmd(interaction) {
   }
 
   await interaction.editReply({ embeds: [warCard(WAR_OK).setDescription(`War dipasang di <#${dropChannel.id}>: ${msg.url}`)] });
+
+  // Reaction dipasang di belakang, supaya admin tidak menunggu rate limit Discord.
+  msg.react(emojiKey).catch(async (err) => {
+    console.error('war: pasang reaction gagal:', err.message);
+    const current = warDrops.get(msg.id);
+    if (current) await warEnd(current, 'closed');
+  });
 }
 
 const warCommands = [
