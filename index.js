@@ -90,9 +90,9 @@ function loadConfig() {
     poweredBy: cleanText(pick('POWERED_BY', 'poweredBy'), 'ALLZXRAA COMMUNITY'),
     thumbnailUrl: cleanUrl(pick('THUMBNAIL_URL', 'thumbnailUrl')),
     // UNSET kalau kosong: fitur itu nonaktif dan diberi tahu di log saat start.
-    welcomeChannelId: cleanSnowflake(pick('WELCOME_CHANNEL_ID', '1540584065068048405')),
-    goodbyeChannelId: cleanSnowflake(pick('GOODBYE_CHANNEL_ID', '1540584065068048405')),
-    inviteLogChannelId: cleanSnowflake(pick('INVITE_LOG_CHANNEL_ID', '1574202934365790258')),
+    welcomeChannelId: cleanSnowflake(pick('WELCOME_CHANNEL_ID', 'welcomeChannelId')),
+    goodbyeChannelId: cleanSnowflake(pick('GOODBYE_CHANNEL_ID', 'goodbyeChannelId')),
+    inviteLogChannelId: cleanSnowflake(pick('INVITE_LOG_CHANNEL_ID', 'inviteLogChannelId')),
     obfu: Object.freeze({
       key: cleanIntArray(pick('OBFU_KEY', 'obfuKey'), DEFAULT_OBFU_KEY),
       chunkHexChars: 4096,
@@ -703,7 +703,34 @@ async function handleObfuLink(interaction) {
   }
 }
 
+// ============ peringatan token di file repo ============
+// Pola kasar untuk token bot Discord: tiga bagian dipisah titik.
+const TOKEN_PATTERN = /[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}/;
+
+function warnIfSecretsInRepoFiles() {
+  const exampleFile = path.join(__dirname, 'config.example.json');
+  for (const file of [__filename, exampleFile]) {
+    let text;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    if (TOKEN_PATTERN.test(text)) {
+      console.warn(
+        `PERINGATAN KEAMANAN: ${path.basename(file)} berisi sesuatu yang mirip token Discord. ` +
+        'Jangan commit file ini ke repo. Hapus tokennya, lalu Reset Token di Discord Developer Portal karena token itu sudah terekspos.'
+      );
+    }
+  }
+  const example = readJsonFile(exampleFile);
+  if (example && typeof example.token === 'string' && example.token.trim() && !example.token.startsWith('ISI_')) {
+    console.warn('PERINGATAN KEAMANAN: config.example.json berisi nilai "token" yang bukan placeholder. Kosongkan nilai itu sebelum di-push.');
+  }
+}
+
 // ============ bot ============
+warnIfSecretsInRepoFiles();
 const cfg = loadConfig();
 loadXpStore();
 loadInviteStore();
