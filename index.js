@@ -1068,30 +1068,18 @@ async function afkHandle(message) {
 }
 // ============ akhir AFK ============
 
-// ============ /xp-only: kunci Send Messages di channel selain channel XP ============
-// Mengubah izin @everyone di banyak channel, jadi wajib preview dulu dan apply butuh konfirmasi.
-const XP_ONLY_DATA_FILE = path.join(__dirname, 'xp-only-data.json');
-// Channel yang Send Messages-nya dikunci oleh bot ini. Dipakai /xp-only release supaya aturan admin lain tidak ikut dibuka.
-let xpOnlyLocked = new Set();
+// ============ /xp-only preview: lihat channel yang akan dikunci (tanpa mengubah apa pun) ============
 const XP_ONLY_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 const XP_ONLY_FLAGS = [PermissionFlagsBits.SendMessages, PermissionFlagsBits.SendMessagesInThreads];
-
-function loadXpOnly() {
-  const raw = readJsonFile(XP_ONLY_DATA_FILE);
-  if (raw && Array.isArray(raw.locked)) xpOnlyLocked = new Set(raw.locked.filter((x) => typeof x === 'string'));
-}
-
-const xpOnlySaver = createSaver(XP_ONLY_DATA_FILE, () => ({ locked: [...xpOnlyLocked] }));
 
 function botCanEditChannel(channel) {
   const me = channel.guild.members.me;
   return !!me && channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels]);
 }
 
-// Hanya menghitung rencana, tidak mengubah apa pun.
 function xpOnlyPlan(guild) {
   const everyone = guild.roles.everyone;
-  const plan = { toLock: [], already: [], skipped: [] };
+  const plan = { toLock: [], skipped: [] };
   for (const ch of guild.channels.cache.values()) {
     if (!XP_ONLY_CHANNEL_TYPES.includes(ch.type)) continue;
     if (ch.id === cfg.xpChannelId) continue;
@@ -1101,22 +1089,10 @@ function xpOnlyPlan(guild) {
     }
     const ow = ch.permissionOverwrites.cache.get(everyone.id);
     const hasOwnRule = !!ow && XP_ONLY_FLAGS.some((f) => ow.allow.has(f) || ow.deny.has(f));
-    const lockedByUs = xpOnlyLocked.has(ch.id) && !!ow && ow.deny.has(PermissionFlagsBits.SendMessages);
-    if (lockedByUs) plan.already.push(ch);
-    else if (hasOwnRule) plan.skipped.push({ ch, reason: 'sudah punya aturan Send Messages sendiri, tidak disentuh' });
+    if (hasOwnRule) plan.skipped.push({ ch, reason: 'sudah punya aturan Send Messages sendiri' });
     else plan.toLock.push(ch);
   }
   return plan;
-}
-
-// Memastikan @everyone bisa kirim pesan di channel XP. Tidak mengubah kalau sudah bisa.
-async function ensureXpChannelOpen(guild) {
-  const xp = guild.channels.cache.get(cfg.xpChannelId);
-  if (!xp || !XP_ONLY_CHANNEL_TYPES.includes(xp.type)) throw new Error('channel XP tidak ditemukan atau bukan channel teks');
-  const everyone = guild.roles.everyone;
-  if (xp.permissionsFor(everyone).has(PermissionFlagsBits.SendMessages)) return false;
-  await xp.permissionOverwrites.edit(everyone, { SendMessages: true }, { reason: '/xp-only: channel XP harus bisa dipakai' });
-  return true;
 }
 
 function listChannels(channels, max = 25) {
@@ -1125,85 +1101,22 @@ function listChannels(channels, max = 25) {
   return channels.length > max ? `${shown} dan ${channels.length - max} lagi` : shown;
 }
 
-function xpOnlyText(title, plan) {
-  const lines = [
-    `**${title}**`,
-    `Dikunci (${plan.toLock.length}): ${listChannels(plan.toLock)}`,
-    `Sudah dikunci sebelumnya (${plan.already.length}): ${listChannels(plan.already)}`,
-    `Dilewati (${plan.skipped.length}):`,
-  ];
-  for (const x of plan.skipped.slice(0, 15)) lines.push(`• ${x.ch}: ${x.reason}`);
-  if (plan.skipped.length > 15) lines.push(`• dan ${plan.skipped.length - 15} lagi`);
-  return lines.join('\n').slice(0, 1900);
-}
-
 async function handleXpOnly(interaction) {
   if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
   if (!cfg.xpChannelId) {
     return interaction.reply({ content: 'Isi `xpChannelId` (env LEVEL_XP_CHANNEL_ID) dulu, bot perlu tahu channel XP.', flags: MessageFlags.Ephemeral });
   }
-  const guild = interaction.guild;
-  if (!guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
-    return interaction.reply({ content: 'Bot butuh izin Manage Channels di server ini.', flags: MessageFlags.Ephemeral });
-  }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const sub = interaction.options.getSubcommand();
-  const everyone = guild.roles.everyone;
-  const reason = `/xp-only ${sub} oleh ${interaction.user.tag}`;
   try {
-    await guild.channels.fetch();
-
-    if (sub === 'preview') {
-      return await interaction.editReply({ content: xpOnlyText('Rencana (belum ada yang diubah)', xpOnlyPlan(guild)) });
-    }
-
-    if (sub === 'apply') {
-      const plan = xpOnlyPlan(guild);
-      if (!interaction.options.getBoolean('konfirmasi')) {
-        return await interaction.editReply({
-          content: `${xpOnlyText('Belum ada yang diubah', plan)}\n\nJalankan lagi \`/xp-only apply konfirmasi:true\` untuk mengunci channel di atas.`,
-        });
-      }
-      const xpOpened = await ensureXpChannelOpen(guild);
-      const failed = [];
-      for (const ch of plan.toLock) {
-        try {
-          await ch.permissionOverwrites.edit(everyone, { SendMessages: false, SendMessagesInThreads: false }, { reason });
-          xpOnlyLocked.add(ch.id);
-        } catch (err) {
-          failed.push(`${ch} (${err.message})`);
-        }
-      }
-      xpOnlySaver.save();
-      const lines = [
-        `**Selesai.** Dikunci: ${plan.toLock.length - failed.length}. Sudah dikunci sebelumnya: ${plan.already.length}. Dilewati: ${plan.skipped.length}.`,
-        xpOpened ? `Channel XP ${guild.channels.cache.get(cfg.xpChannelId)} dibuka untuk @everyone.` : 'Channel XP sudah bisa dipakai @everyone, tidak diubah.',
-      ];
-      if (failed.length) lines.push(`Gagal: ${listChannels(failed.map((f) => ({ toString: () => f })))}`);
-      return await interaction.editReply({ content: lines.join('\n').slice(0, 1900) });
-    }
-
-    // sub === 'release'
-    let released = 0;
-    const failed = [];
-    for (const id of [...xpOnlyLocked]) {
-      const ch = guild.channels.cache.get(id);
-      const ow = ch?.permissionOverwrites.cache.get(everyone.id);
-      if (!ch || !ow || !ow.deny.has(PermissionFlagsBits.SendMessages)) {
-        xpOnlyLocked.delete(id); // channel hilang atau aturannya sudah diubah manual
-        continue;
-      }
-      try {
-        await ch.permissionOverwrites.edit(everyone, { SendMessages: null, SendMessagesInThreads: null }, { reason });
-        xpOnlyLocked.delete(id);
-        released += 1;
-      } catch (err) {
-        failed.push(`${ch} (${err.message})`);
-      }
-    }
-    xpOnlySaver.save();
-    const lines = [`**Selesai.** Dibuka: ${released}. Tersisa (gagal): ${failed.length}.`];
-    if (failed.length) lines.push(`Gagal: ${failed.join(', ')}`);
+    await interaction.guild.channels.fetch();
+    const plan = xpOnlyPlan(interaction.guild);
+    const lines = [
+      '**Rencana (tidak ada yang diubah)**',
+      `Akan dikunci (${plan.toLock.length}): ${listChannels(plan.toLock)}`,
+      `Dilewati (${plan.skipped.length}):`,
+    ];
+    for (const x of plan.skipped.slice(0, 15)) lines.push(`• ${x.ch}: ${x.reason}`);
+    if (plan.skipped.length > 15) lines.push(`• dan ${plan.skipped.length - 15} lagi`);
     return await interaction.editReply({ content: lines.join('\n').slice(0, 1900) });
   } catch (err) {
     console.error('xp-only error:', err);
@@ -1219,7 +1132,6 @@ loadXpStore();
 loadInviteStore();
 loadLevelRoles();
 loadAfk();
-loadXpOnly();
 
 const client = new Client({
   intents: [
@@ -1285,10 +1197,7 @@ const commands = [
     .setDescription('Kunci kirim pesan di channel selain channel XP (admin)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false)
-    .addSubcommand((sub) => sub.setName('preview').setDescription('Lihat channel yang akan dikunci, tanpa mengubah apa pun'))
-    .addSubcommand((sub) => sub.setName('apply').setDescription('Kunci channel lain dan buka channel XP')
-      .addBooleanOption((o) => o.setName('konfirmasi').setDescription('Isi true untuk benar-benar mengubah izin').setRequired(false)))
-    .addSubcommand((sub) => sub.setName('release').setDescription('Buka lagi channel yang dikunci oleh /xp-only apply')),
+    .addSubcommand((sub) => sub.setName('preview').setDescription('Lihat channel yang akan dikunci, tanpa mengubah apa pun')),
 ];
 
 client.once(Events.ClientReady, async (c) => {
