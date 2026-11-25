@@ -20,6 +20,7 @@ const COLOR_OBFU = 0x5865f2;
 const COLOR_LEVEL = 0xfee75c;
 const COLOR_INVITE = 0x5865f2;
 const COLOR_FAIL = 0xed4245;
+const COLOR_INFO = 0x5865f2;
 
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const XP_DATA_FILE = path.join(__dirname, 'xp-data.json');
@@ -921,7 +922,11 @@ async function handleAfk(interaction) {
     const existed = afkMap.delete(`${guildId}:${target.id}`);
     if (existed) afkSaver.save();
     return interaction.reply({
-      content: existed ? `Status AFK ${target} dihapus.` : `${target} tidak sedang AFK.`,
+      embeds: [new EmbedBuilder()
+        .setColor(existed ? COLOR_INFO : COLOR_FAIL)
+        .setDescription(existed ? `✅ Status AFK ${target} dihapus.` : `${target} tidak sedang AFK.`)
+        .setFooter({ text: `Powered by ${cfg.poweredBy}` })
+        .setTimestamp()],
       flags: MessageFlags.Ephemeral,
       allowedMentions: { parse: [] },
     });
