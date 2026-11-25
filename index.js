@@ -1,6 +1,6 @@
 'use strict';
 
-// Satu file: welcome/goodbye, obfuscator (format sama seperti ALLZRA_main.lua),
+// Satu file: welcome/goodbye, obfuscator Lua multi-mode,
 // obfu link aman dari SSRF, sistem XP + level + leaderboard, dan invite log.
 
 const crypto = require('node:crypto');
@@ -9,7 +9,12 @@ const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 const cards = require('./cards');
-const { deobfuscateLegacy } = require('./legacy-deobfuscator');
+const {
+  MODE_CHOICES,
+  WRAPPER_EXPANSION_LIMIT,
+  obfuscateLua,
+  deobfuscateLua,
+} = require('./lua-obfuscator');
 const {
   ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder,
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
@@ -116,7 +121,7 @@ function loadConfig() {
   });
 }
 
-// ============ obfuscator (skema sama persis dengan ALLZRA_main.lua) ============
+// ============ obfuscator Lua ============
 // decode Lua: byte = (hex - K[ki]) % 256, ki berputar lewat seluruh K.
 // encode = inversnya. Sudah diverifikasi byte-exact terhadap file asli.
 const BANNER = `--[[
@@ -136,65 +141,11 @@ const BANNER = `--[[
           Script ini diproteksi — Obfu Lua by ALLZXRAA COMMUNITY
 ]]`;
 
-function encodeBytes(buf, key) {
-  const n = key.length;
-  let ki = 0;
-  let hex = '';
-  for (let i = 0; i < buf.length; i++) {
-    hex += ((buf[i] + key[ki]) % 256).toString(16).padStart(2, '0');
-    ki = (ki + 1) % n;
-  }
-  return hex;
-}
-
-function splitChunks(hex, size) {
-  const chunks = [];
-  for (let i = 0; i < hex.length; i += size) chunks.push(hex.slice(i, i + size));
-  if (chunks.length === 0) chunks.push('');
-  return chunks;
-}
-
-function buildLuaSource(sourceBuf, cfg) {
-  const { key, chunkHexChars } = cfg.obfu;
-  const chunks = splitChunks(encodeBytes(sourceBuf, key), chunkHexChars);
-  const chunksLua = chunks.map((c) => `    "${c}",`).join('\n');
-
-  return `loadstring([=[
-${BANNER}
-local _CHUNKS = {
-${chunksLua}
-}
-local _K = {${key.join(', ')}}
-local _N = #_K
-local _EXPECT = ${sourceBuf.length}
-
-local _parts = {}
-local _ki = 1
-for _, _c in ipairs(_CHUNKS) do
-    for _i = 1, #_c, 2 do
-        local _b = (tonumber(string.sub(_c, _i, _i + 1), 16) - _K[_ki]) % 256
-        _parts[#_parts + 1] = string.char(_b)
-        _ki = _ki % _N + 1
-    end
-end
-local _src = table.concat(_parts)
-if #_src ~= _EXPECT then error("ALLZXRAA: payload rusak", 0) end
-
-local _load = loadstring or load
-local _chunk, _err = _load(_src, "=ALLZXRAA")
-if not _chunk then error(_err, 0) end
-return _chunk(...)
-]=])()
-`;
-}
-
-function obfuscate(sourceBuf, cfg) {
-  if (!Buffer.isBuffer(sourceBuf)) throw new TypeError('sourceBuf harus Buffer');
-  if (sourceBuf.length === 0) throw new Error('source kosong');
-  if (sourceBuf.length > cfg.obfu.maxSourceBytes) {
-    throw new Error(`source terlalu besar (${sourceBuf.length} byte > batas ${cfg.obfu.maxSourceBytes} byte)`);
-  }
-  return buildLuaSource(sourceBuf, cfg);
+function obfuscate(sourceBuf, cfg, mode = 'allzxraa') {
+  return obfuscateLua(sourceBuf, {
+    ...cfg.obfu,
+    banner: BANNER,
+  }, mode);
 }
 
 // ============ SSRF guard untuk /obfu-link ============
@@ -769,11 +720,11 @@ async function sendGoodbye(member) {
   await channel.send({ embeds: [embed] }).catch((err) => console.error('gagal kirim goodbye:', err));
 }
 
-function obfuResultEmbed(interaction, originalBytes, outputBytes, elapsedMs) {
+function obfuResultEmbed(interaction, mode, originalBytes, outputBytes, elapsedMs) {
   return new EmbedBuilder()
     .setColor(COLOR_OBFU)
     .setAuthor({ name: 'Obfuscate Successful', iconURL: client.user.displayAvatarURL() })
-    .setDescription(`${cfg.brandName} — obfuscator Lua (format sama seperti ALLZRA_main.lua).`)
+    .setDescription(`${cfg.brandName} — mode obfuscate: ${MODE_CHOICES.find((choice) => choice.value === mode)?.name || mode}.`)
     .addFields(
       { name: 'Ukuran Asli', value: `${originalBytes} byte`, inline: true },
       { name: 'Ukuran Hasil', value: `${outputBytes} byte`, inline: true },
@@ -795,6 +746,7 @@ function obfuFailEmbed(interaction, note) {
 async function handleObfuFile(interaction) {
   await interaction.deferReply();
   const attachment = interaction.options.getAttachment('file', true);
+  const mode = interaction.options.getString('mode') || 'allzxraa';
   if (attachment.size > cfg.obfu.maxSourceBytes) {
     await interaction.editReply({ embeds: [obfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${cfg.obfu.maxSourceBytes} byte.`)] });
     return;
@@ -810,10 +762,10 @@ async function handleObfuFile(interaction) {
     return;
   }
   try {
-    const outBuf = Buffer.from(obfuscate(buf, cfg), 'utf8');
+    const outBuf = Buffer.from(obfuscate(buf, cfg, mode), 'utf8');
     const name = attachment.name.replace(/\.lua$/i, '') + '.obf.lua';
     await interaction.editReply({
-      embeds: [obfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started)],
+      embeds: [obfuResultEmbed(interaction, mode, buf.length, outBuf.length, Date.now() - started)],
       files: [new AttachmentBuilder(outBuf, { name })],
     });
   } catch (err) {
@@ -824,6 +776,7 @@ async function handleObfuFile(interaction) {
 async function handleObfuLink(interaction) {
   await interaction.deferReply();
   const url = interaction.options.getString('url', true);
+  const mode = interaction.options.getString('mode') || 'allzxraa';
   const started = Date.now();
   let buf;
   try {
@@ -833,9 +786,9 @@ async function handleObfuLink(interaction) {
     return;
   }
   try {
-    const outBuf = Buffer.from(obfuscate(buf, cfg), 'utf8');
+    const outBuf = Buffer.from(obfuscate(buf, cfg, mode), 'utf8');
     await interaction.editReply({
-      embeds: [obfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started)],
+      embeds: [obfuResultEmbed(interaction, mode, buf.length, outBuf.length, Date.now() - started)],
       files: [new AttachmentBuilder(outBuf, { name: 'obfuscated.lua' })],
     });
   } catch (err) {
@@ -867,16 +820,20 @@ function deobfuFailEmbed(interaction, note) {
 }
 
 function deobfuscate(sourceBuf) {
-  return deobfuscateLegacy(sourceBuf, {
+  return deobfuscateLua(sourceBuf, {
     banner: BANNER,
     maxSourceBytes: cfg.obfu.maxSourceBytes,
   });
 }
 
+function maxObfuWrapperBytes() {
+  return cfg.obfu.maxSourceBytes * WRAPPER_EXPANSION_LIMIT + 64 * 1024;
+}
+
 async function handleDeobfuFile(interaction) {
   await interaction.deferReply();
   const attachment = interaction.options.getAttachment('file', true);
-  const maxWrapperBytes = cfg.obfu.maxSourceBytes * 3 + 64 * 1024;
+  const maxWrapperBytes = maxObfuWrapperBytes();
   if (attachment.size > maxWrapperBytes) {
     await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${maxWrapperBytes} byte.`)] });
     return;
@@ -911,7 +868,7 @@ async function handleDeobfuLink(interaction) {
   const started = Date.now();
   let buf;
   try {
-    const maxWrapperBytes = cfg.obfu.maxSourceBytes * 3 + 64 * 1024;
+    const maxWrapperBytes = maxObfuWrapperBytes();
     buf = await fetchTextSafe(url, { maxBytes: maxWrapperBytes, timeoutMs: cfg.obfu.requestTimeoutMs });
   } catch (err) {
     await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `Gagal mengambil link: ${err.message}`)] });
@@ -1341,19 +1298,23 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName('obfu-file')
-    .setDescription('Obfuscate file .lua (format sama seperti ALLZRA_main.lua)')
-    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true)),
+    .setDescription('Obfuscate file Lua dengan mode pilihan')
+    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true))
+    .addStringOption((o) => o.setName('mode').setDescription('Mode (default: ALLZXRAA lama)')
+      .addChoices(...MODE_CHOICES).setRequired(false)),
   new SlashCommandBuilder()
     .setName('obfu-link')
-    .setDescription('Obfuscate isi dari link raw ke format .lua terproteksi')
-    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true)),
+    .setDescription('Obfuscate source Lua dari link dengan mode pilihan')
+    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true))
+    .addStringOption((o) => o.setName('mode').setDescription('Mode (default: ALLZXRAA lama)')
+      .addChoices(...MODE_CHOICES).setRequired(false)),
   new SlashCommandBuilder()
     .setName('deobfu-file')
-    .setDescription('Deobfuscate file dengan format lama ALLZXRAA')
+    .setDescription('Deobfuscate file dari semua mode ALLZXRAA')
     .addAttachmentOption((o) => o.setName('file').setDescription('File .lua hasil obfuscate ALLZXRAA').setRequired(true)),
   new SlashCommandBuilder()
     .setName('deobfu-link')
-    .setDescription('Deobfuscate link raw dengan format lama ALLZXRAA')
+    .setDescription('Deobfuscate link raw dari semua mode ALLZXRAA')
     .addStringOption((o) => o.setName('url').setDescription('Link raw berisi hasil obfuscate ALLZXRAA').setRequired(true)),
   new SlashCommandBuilder()
     .setName('level')

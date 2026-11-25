@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { deobfuscateLegacy } = require('../legacy-deobfuscator');
+const { deobfuscateLua } = require('../lua-obfuscator');
 
 const BANNER = '-- ALLZXRAA legacy test banner';
 const LOADER_BODY = `local _parts = {}
@@ -51,6 +52,7 @@ test('decodes the legacy wrapper, preserves banner, and does not execute Lua', (
   });
 
   assert.deepEqual(output, Buffer.concat([Buffer.from(`${BANNER}\n`), source]));
+  assert.deepEqual(deobfuscateLua(legacyWrapper(source), { banner: BANNER, maxSourceBytes: 1024 }), output);
 });
 
 test('rejects altered loader code and payload length mismatches', () => {
