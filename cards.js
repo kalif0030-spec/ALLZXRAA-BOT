@@ -17,7 +17,7 @@ try {
   napi = null;
 }
 
-const FONT_FILE = path.join(__dirname, 'assets', 'font.ttf');
+const FONT_FILE = path.join(__dirname, 'font.ttf');
 const FONT_FAMILY = 'CardFont';
 let fontReady = false;
 if (napi && fs.existsSync(FONT_FILE)) {
