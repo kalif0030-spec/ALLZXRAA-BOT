@@ -8,6 +8,7 @@ const dns = require('node:dns').promises;
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
+const cards = require('./cards');
 const {
   ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder,
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
@@ -686,12 +687,41 @@ function baseEmbed(color) {
   return e;
 }
 
+function cardAvatarUrl(user) {
+  return user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
+}
+
+function cardName(user) {
+  return user.globalName ?? user.username;
+}
+
 async function sendWelcome(member) {
   if (!cfg.welcomeChannelId) return;
   const channel = await member.guild.channels.fetch(cfg.welcomeChannelId).catch(() => null);
   if (!channel || !channel.isTextBased()) {
     console.warn(`welcome: channel ${cfg.welcomeChannelId} tidak ditemukan atau bukan channel teks`);
     return;
+  }
+  if (cards.isAvailable()) {
+    try {
+      const png = await cards.renderWelcomeCard({
+        avatarUrl: cardAvatarUrl(member.user),
+        name: cardName(member.user),
+        memberCount: member.guild.memberCount,
+      });
+      const embed = new EmbedBuilder()
+        .setColor(COLOR_WELCOME)
+        .setDescription(`## Selamat datang ${member} di **${member.guild.name}**!\nSemoga betah ya, kamu member ke-${member.guild.memberCount}.`)
+        .setImage('attachment://welcome.png');
+      await channel.send({
+        embeds: [embed],
+        files: [new AttachmentBuilder(png, { name: 'welcome.png' })],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    } catch (err) {
+      console.error('welcome card gagal, pakai embed biasa:', err);
+    }
   }
   const embed = baseEmbed(COLOR_WELCOME)
     .setAuthor({ name: 'Member Baru Bergabung', iconURL: client.user.displayAvatarURL() })
@@ -711,6 +741,23 @@ async function sendGoodbye(member) {
   if (!channel || !channel.isTextBased()) {
     console.warn(`goodbye: channel ${cfg.goodbyeChannelId} tidak ditemukan atau bukan channel teks`);
     return;
+  }
+  if (cards.isAvailable()) {
+    try {
+      const png = await cards.renderGoodbyeCard({
+        avatarUrl: cardAvatarUrl(member.user),
+        name: cardName(member.user),
+        memberCount: member.guild.memberCount,
+      });
+      await channel.send({
+        content: `## **${cardName(member.user)}** telah keluar dari server\nSampai jumpa lagi! ❤️`,
+        files: [new AttachmentBuilder(png, { name: 'goodbye.png' })],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    } catch (err) {
+      console.error('goodbye card gagal, pakai embed biasa:', err);
+    }
   }
   const embed = baseEmbed(COLOR_GOODBYE)
     .setAuthor({ name: 'Member Keluar', iconURL: client.user.displayAvatarURL() })
@@ -906,16 +953,76 @@ function allowedInChannel(interaction, channelId) {
 }
 
 // ============ /level dan /leaderboard ============
+async function userCardInfo(userId) {
+  try {
+    const user = client.users.cache.get(userId) ?? await client.users.fetch(userId);
+    return { name: cardName(user), avatarUrl: cardAvatarUrl(user) };
+  } catch {
+    return {
+      name: 'Unknown',
+      avatarUrl: `https://cdn.discordapp.com/embed/avatars/${Number((BigInt(userId) >> 22n) % 6n)}.png`,
+    };
+  }
+}
+
+async function levelCardFile(user, guildId) {
+  const entry = users.get(`${guildId}:${user.id}`) || { xp: 0 };
+  const info = levelInfo(entry.xp);
+  const rank = guildRanking(guildId).findIndex((r) => r.userId === user.id) + 1;
+  const png = await cards.renderLevelCard({
+    avatarUrl: cardAvatarUrl(user),
+    name: cardName(user),
+    level: info.level,
+    rank,
+    xp: entry.xp,
+    into: info.into,
+    span: info.span,
+    ratio: info.ratio,
+  });
+  return new AttachmentBuilder(png, { name: 'level.png' });
+}
+
+async function leaderboardCardFile(guild) {
+  const top = guildRanking(guild.id).slice(0, LEADERBOARD_SIZE);
+  const rows = await Promise.all(top.map(async (r) => {
+    const info = levelInfo(r.xp);
+    const who = await userCardInfo(r.userId);
+    return { name: who.name, avatarUrl: who.avatarUrl, level: info.level, xp: r.xp, ratio: info.ratio };
+  }));
+  const png = await cards.renderLeaderboardCard({ guildName: guild.name, rows });
+  return new AttachmentBuilder(png, { name: 'leaderboard.png' });
+}
+
 async function handleLevel(interaction) {
   if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
   if (!allowedInChannel(interaction, cfg.levelCommandChannelId)) return;
   const target = interaction.options.getUser('user') ?? interaction.user;
+  if (cards.isAvailable()) {
+    await interaction.deferReply(); // render gambar + unduh avatar bisa lewat 3 detik
+    try {
+      const file = await levelCardFile(target, interaction.guild.id);
+      return await interaction.editReply({ files: [file], allowedMentions: { parse: [] } });
+    } catch (err) {
+      console.error('level card gagal, pakai embed biasa:', err);
+      return interaction.editReply({ embeds: [levelCardEmbed(target, interaction.guild.id)], allowedMentions: { parse: [] } });
+    }
+  }
   return interaction.reply({ embeds: [levelCardEmbed(target, interaction.guild.id)], allowedMentions: { parse: [] } });
 }
 
 async function handleLeaderboard(interaction) {
   if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
   if (!allowedInChannel(interaction, cfg.levelCommandChannelId)) return;
+  if (cards.isAvailable()) {
+    await interaction.deferReply();
+    try {
+      const file = await leaderboardCardFile(interaction.guild);
+      return await interaction.editReply({ files: [file], allowedMentions: { parse: [] } });
+    } catch (err) {
+      console.error('leaderboard card gagal, pakai embed biasa:', err);
+      return interaction.editReply({ embeds: [leaderboardEmbed(interaction.guild)], allowedMentions: { parse: [] } });
+    }
+  }
   if (leaderboardV2Available()) {
     try {
       const container = await leaderboardContainer(interaction.guild);
