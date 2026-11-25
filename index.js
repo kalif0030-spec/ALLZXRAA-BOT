@@ -9,9 +9,11 @@ const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 const {
+  ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder,
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
   MessageFlags, PermissionFlagsBits, SlashCommandBuilder,
 } = require('discord.js');
+const luaTools = require('./lua-tools');
 
 // ============ konstanta ============
 const COLOR_WELCOME = 0x57f287;
@@ -29,16 +31,10 @@ const INVITE_DATA_FILE = path.join(__dirname, 'invite-data.json');
 // Kunci default diambil persis dari ALLZRA_main.lua (_K), sudah diverifikasi byte-exact.
 const DEFAULT_OBFU_KEY = [231, 239, 163, 220, 149, 7, 70, 62, 248, 167, 96, 58, 38, 110, 2, 142, 238, 40, 50, 244, 103, 29, 252, 216];
 
-const XP_MIN = 15;
-const XP_MAX = 25;
-const XP_COOLDOWN_MS = 60 * 1000;
 const SAVE_DELAY_MS = 5000;
 const MAX_LEVEL = 1000;
 const LEADERBOARD_SIZE = 10;
 const MAX_JOIN_RECORDS = 20000;
-// Pemicu teks (tanpa membedakan huruf besar/kecil)
-const LEVEL_TRIGGER = /^(allzxraa\s+level|alevel)$/i;
-const LEADERBOARD_TRIGGER = /^alb$/i;
 
 // ============ config ============
 function readLocalConfig() {
@@ -76,6 +72,33 @@ function cleanIntArray(v, fallback) {
   return nums;
 }
 
+function cleanJsonObject(v, fallback) {
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+  if (typeof v === 'string' && v.trim()) {
+    try {
+      const o = JSON.parse(v);
+      if (o && typeof o === 'object' && !Array.isArray(o)) return o;
+    } catch {
+      // bukan JSON valid: pakai fallback
+    }
+  }
+  return fallback;
+}
+
+function cleanBool(v, fallback) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') {
+    if (/^(true|1|yes|on)$/i.test(v.trim())) return true;
+    if (/^(false|0|no|off)$/i.test(v.trim())) return false;
+  }
+  return fallback;
+}
+
+function cleanPosInt(v, fallback) {
+  const n = Number.parseInt(v, 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
 function loadConfig() {
   const local = readLocalConfig();
   const pick = (envName, key) => process.env[envName] ?? local[key];
@@ -97,8 +120,36 @@ function loadConfig() {
     obfu: Object.freeze({
       key: cleanIntArray(pick('OBFU_KEY', 'obfuKey'), DEFAULT_OBFU_KEY),
       chunkHexChars: 4096,
-      maxSourceBytes: Number.parseInt(pick('OBFU_MAX_BYTES', 'obfuMaxBytes'), 10) || 1000000,
+      maxSourceBytes: Number.parseInt(pick('OBFU_MAX_BYTES', 'obfuMaxBytes'), 10) || 25 * 1024 * 1024,
       requestTimeoutMs: 10000,
+    }),
+    // Kecepatan naik level: bawaan 1 XP per 60 detik per member. Kebutuhan XP per level ada di cumulativeXp.
+    xp: (() => {
+      const min = cleanPosInt(pick('XP_MIN', 'xpMin'), 1);
+      const max = Math.max(min, cleanPosInt(pick('XP_MAX', 'xpMax'), min));
+      return Object.freeze({ min, max, cooldownMs: cleanPosInt(pick('XP_COOLDOWN_SECONDS', 'xpCooldownSeconds'), 60) * 1000 });
+    })(),
+    // UNSET kalau kosong: engine itu nonaktif dan diberi tahu di log saat start.
+    luraph: Object.freeze({
+      apiKey: cleanText(process.env.LURAPH_API_KEY || process.env.LPH_API_KEY || local.luraphApiKey, null),
+      baseUrl: 'https://api.lura.ph/v1/',
+      node: cleanText(pick('LURAPH_NODE', 'luraphNode'), null), // null = pakai recommendedId dari API
+      options: cleanJsonObject(pick('LURAPH_OPTIONS', 'luraphOptions'), {}), // {} = bawaan node, sama seperti contoh SDK
+      jobTimeoutMs: cleanPosInt(pick('LURAPH_TIMEOUT_MS', 'luraphTimeoutMs'), 5 * 60 * 1000),
+    }),
+    prometheus: Object.freeze({
+      dir: cleanText(pick('PROMETHEUS_DIR', 'prometheusDir'), null),
+      luaBin: cleanText(pick('PROMETHEUS_LUA', 'prometheusLua'), 'lua'),
+      preset: cleanText(pick('PROMETHEUS_PRESET', 'prometheusPreset'), 'Medium'),
+      timeoutMs: 60000,
+    }),
+    sandbox: Object.freeze({
+      enabled: cleanBool(pick('SANDBOX_ENABLED', 'sandboxEnabled'), true),
+      inAuto: cleanBool(pick('SANDBOX_IN_AUTO', 'sandboxInAuto'), true),
+      timeoutMs: cleanPosInt(pick('SANDBOX_TIMEOUT_MS', 'sandboxTimeoutMs'), 20000),
+      memoryMb: cleanPosInt(pick('SANDBOX_MEMORY_MB', 'sandboxMemoryMb'), 192),
+      maxLayers: 16,
+      maxLogLines: 2000,
     }),
   });
 }
@@ -208,7 +259,7 @@ const blocked = new net.BlockList();
 ].forEach(([addr, prefix]) => blocked.addSubnet(addr, prefix, 'ipv4'));
 [
   ['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10],
-  ['ff00::', 8], ['::ffff:0:0', 96],
+  ['ff00::', 8],
 ].forEach(([addr, prefix]) => blocked.addSubnet(addr, prefix, 'ipv6'));
 
 function parseHttpUrl(raw) {
@@ -221,24 +272,38 @@ function parseHttpUrl(raw) {
   return u.protocol === 'http:' || u.protocol === 'https:' ? u : null;
 }
 
-async function hostIsPublic(hostname) {
+// IPv4-mapped IPv6 (::ffff:1.2.3.4) dicek sebagai IPv4 biasa. Aturan IPv4 tidak boleh dicek lewat aturan IPv6 ::ffff:, karena itu menangkap semua IPv4.
+function isBlockedAddress(address, family) {
+  let addr = address;
+  let fam = family === 6 ? 'ipv6' : 'ipv4';
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(addr);
+  if (mapped) {
+    addr = mapped[1];
+    fam = 'ipv4';
+  }
+  return blocked.check(addr, fam);
+}
+
+// Mengembalikan { ok, reason }. reason menjelaskan kenapa host ditolak, supaya admin bisa mengecek sendiri.
+async function resolvePublic(hostname) {
   const bare = hostname.replace(/^\[|\]$/g, '');
   let infos;
   try {
     infos = await dns.lookup(bare, { all: true });
-  } catch {
-    return false;
+  } catch (err) {
+    return { ok: false, reason: `DNS gagal resolve (${err.code || err.message})` };
   }
-  if (infos.length === 0) return false;
-  return infos.every((i) => !blocked.check(i.address, i.family === 6 ? 'ipv6' : 'ipv4'));
+  if (infos.length === 0) return { ok: false, reason: 'DNS tidak mengembalikan alamat' };
+  const bad = infos.find((i) => isBlockedAddress(i.address, i.family));
+  if (bad) return { ok: false, reason: `alamat ${bad.address} termasuk jaringan internal` };
+  return { ok: true, reason: null };
 }
 
 async function fetchTextSafe(raw, { maxBytes, timeoutMs }) {
   const url = parseHttpUrl(raw);
   if (url === null) throw new Error('itu bukan link http(s) yang valid');
-  if (!(await hostIsPublic(url.hostname))) {
-    throw new Error(`host ditolak (non-publik atau tidak ter-resolve): ${url.hostname}`);
-  }
+  const check = await resolvePublic(url.hostname);
+  if (!check.ok) throw new Error(`host ${url.hostname} ditolak: ${check.reason}`);
   let res;
   try {
     res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) });
@@ -339,14 +404,14 @@ function loadXpStore() {
 
 const xpSaver = createSaver(XP_DATA_FILE, () => ({ users: Object.fromEntries(users) }));
 
-// Anti-spam: cuma dapat XP sekali per XP_COOLDOWN_MS per user per server.
+// Anti-spam: cuma dapat XP sekali per cfg.xp.cooldownMs per user per server.
 // Mengembalikan null kalau masih cooldown. Kalau dapat XP, kembalikan { leveledUp, level }.
 function awardXp(guildId, userId, now = Date.now()) {
   const key = `${guildId}:${userId}`;
   const entry = users.get(key) || { xp: 0, lastAt: 0 };
-  if (now - entry.lastAt < XP_COOLDOWN_MS) return null;
+  if (now - entry.lastAt < cfg.xp.cooldownMs) return null;
   const before = levelInfo(entry.xp).level;
-  entry.xp += XP_MIN + crypto.randomInt(XP_MAX - XP_MIN + 1);
+  entry.xp += cfg.xp.min + crypto.randomInt(cfg.xp.max - cfg.xp.min + 1);
   entry.lastAt = now;
   users.set(key, entry);
   xpSaver.schedule();
@@ -440,6 +505,45 @@ function leaderboardEmbed(guild) {
   const icon = guild.iconURL();
   if (icon) embed.setThumbnail(icon);
   return embed;
+}
+
+// Tampilan leaderboard Components V2 (container + baris dengan avatar). Butuh discord.js yang punya
+// builder V2 (tutorial yang kubaca menyebut 14.19.3 atau lebih baru); kalau tidak ada, jatuh ke embed.
+const LEADERBOARD_V2_ROWS = 10; // batas Discord 40 komponen per pesan: 10 baris x 3 + container + judul = 32
+
+function leaderboardV2Available() {
+  return [ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder].every((c) => typeof c === 'function')
+    && MessageFlags.IsComponentsV2 !== undefined;
+}
+
+async function userAvatarUrl(userId) {
+  try {
+    const user = client.users.cache.get(userId) ?? await client.users.fetch(userId);
+    return user.displayAvatarURL({ extension: 'png', size: 128 });
+  } catch {
+    return `https://cdn.discordapp.com/embed/avatars/${Number((BigInt(userId) >> 22n) % 6n)}.png`;
+  }
+}
+
+async function leaderboardContainer(guild) {
+  const rows = guildRanking(guild.id).slice(0, Math.min(LEADERBOARD_SIZE, LEADERBOARD_V2_ROWS));
+  const avatars = await Promise.all(rows.map((r) => userAvatarUrl(r.userId)));
+  const container = new ContainerBuilder()
+    .setAccentColor(COLOR_LEVEL)
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`# ${guild.name}\n-# Leaderboard level • Powered by ${cfg.poweredBy}`));
+  if (rows.length === 0) {
+    return container.addTextDisplayComponents(new TextDisplayBuilder().setContent('Belum ada yang dapat XP.'));
+  }
+  rows.forEach((r, i) => {
+    const info = levelInfo(r.xp);
+    const text = `**#${i + 1}** • <@${r.userId}> • LVL: ${info.level}\n\`${progressBar(info.ratio, 14)}\` ${Math.floor(info.ratio * 100)}% • ${r.xp} XP`;
+    container.addSectionComponents(
+      new SectionBuilder()
+        .addTextDisplayComponents(new TextDisplayBuilder().setContent(text))
+        .setThumbnailAccessory(new ThumbnailBuilder({ media: { url: avatars[i] } })),
+    );
+  });
+  return container;
 }
 
 // ============ invite log ============
@@ -672,15 +776,25 @@ async function sendGoodbye(member) {
   await channel.send({ embeds: [embed] }).catch((err) => console.error('gagal kirim goodbye:', err));
 }
 
-function obfuResultEmbed(interaction, originalBytes, outputBytes, elapsedMs) {
+const OBFU_ENGINE_LABEL = {
+  allzra: 'ALLZRA (bawaan)',
+  luraph: 'Luraph (API resmi)',
+  prometheus: 'Prometheus (lokal)',
+};
+const OBFU_ENGINE_SUFFIX = { allzra: 'obf', luraph: 'luraph', prometheus: 'prom' };
+
+function obfuResultEmbed(interaction, originalBytes, outputBytes, elapsedMs, engine = 'allzra') {
   return new EmbedBuilder()
     .setColor(COLOR_OBFU)
     .setAuthor({ name: 'Obfuscate Successful', iconURL: client.user.displayAvatarURL() })
-    .setDescription(`${cfg.brandName} — obfuscator Lua (format sama seperti ALLZRA_main.lua).`)
+    .setDescription(engine === 'allzra'
+      ? `${cfg.brandName} — obfuscator Lua (format sama seperti ALLZRA_main.lua).`
+      : `${cfg.brandName} — obfuscator Lua lewat ${OBFU_ENGINE_LABEL[engine]}.`)
     .addFields(
       { name: 'Ukuran Asli', value: `${originalBytes} byte`, inline: true },
       { name: 'Ukuran Hasil', value: `${outputBytes} byte`, inline: true },
-      { name: 'Waktu Proses', value: `${(elapsedMs / 1000).toFixed(2)}s`, inline: true }
+      { name: 'Waktu Proses', value: `${(elapsedMs / 1000).toFixed(2)}s`, inline: true },
+      { name: 'Engine', value: OBFU_ENGINE_LABEL[engine], inline: true }
     )
     .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
     .setTimestamp();
@@ -695,8 +809,19 @@ function obfuFailEmbed(interaction, note) {
     .setTimestamp();
 }
 
+// Satu pintu untuk semua mesin obfuscate. allzra tetap memakai obfuscate() di atas.
+async function obfuscateWith(engine, buf, fileName) {
+  if (engine === 'allzra') return Buffer.from(obfuscate(buf, cfg), 'utf8');
+  if (buf.length === 0) throw new Error('source kosong');
+  if (buf.length > cfg.obfu.maxSourceBytes) {
+    throw new Error(`source terlalu besar (${buf.length} byte > batas ${cfg.obfu.maxSourceBytes} byte)`);
+  }
+  return luaTools.obfuscateExternal(engine, buf, cfg, fileName);
+}
+
 async function handleObfuFile(interaction) {
   await interaction.deferReply();
+  const engine = interaction.options.getString('engine') ?? 'allzra';
   const attachment = interaction.options.getAttachment('file', true);
   if (attachment.size > cfg.obfu.maxSourceBytes) {
     await interaction.editReply({ embeds: [obfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${cfg.obfu.maxSourceBytes} byte.`)] });
@@ -713,10 +838,10 @@ async function handleObfuFile(interaction) {
     return;
   }
   try {
-    const outBuf = Buffer.from(obfuscate(buf, cfg), 'utf8');
-    const name = attachment.name.replace(/\.lua$/i, '') + '.obf.lua';
+    const outBuf = await obfuscateWith(engine, buf, attachment.name);
+    const name = attachment.name.replace(/\.lua$/i, '') + `.${OBFU_ENGINE_SUFFIX[engine]}.lua`;
     await interaction.editReply({
-      embeds: [obfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started)],
+      embeds: [obfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started, engine)],
       files: [new AttachmentBuilder(outBuf, { name })],
     });
   } catch (err) {
@@ -726,6 +851,7 @@ async function handleObfuFile(interaction) {
 
 async function handleObfuLink(interaction) {
   await interaction.deferReply();
+  const engine = interaction.options.getString('engine') ?? 'allzra';
   const url = interaction.options.getString('url', true);
   const started = Date.now();
   let buf;
@@ -736,10 +862,11 @@ async function handleObfuLink(interaction) {
     return;
   }
   try {
-    const outBuf = Buffer.from(obfuscate(buf, cfg), 'utf8');
+    const outBuf = await obfuscateWith(engine, buf, 'link.lua');
+    const name = engine === 'allzra' ? 'obfuscated.lua' : `obfuscated.${OBFU_ENGINE_SUFFIX[engine]}.lua`;
     await interaction.editReply({
-      embeds: [obfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started)],
-      files: [new AttachmentBuilder(outBuf, { name: 'obfuscated.lua' })],
+      embeds: [obfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started, engine)],
+      files: [new AttachmentBuilder(outBuf, { name })],
     });
   } catch (err) {
     await interaction.editReply({ embeds: [obfuFailEmbed(interaction, err.message || String(err))] });
@@ -841,6 +968,27 @@ async function handleLevelRole(interaction) {
   return reply(`Level ${level} sekarang memberi role <@&${role.id}>.`);
 }
 // ============ akhir role hadiah level ============
+
+// ============ /level dan /leaderboard ============
+async function handleLevel(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  const target = interaction.options.getUser('user') ?? interaction.user;
+  return interaction.reply({ embeds: [levelCardEmbed(target, interaction.guild.id)], allowedMentions: { parse: [] } });
+}
+
+async function handleLeaderboard(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (leaderboardV2Available()) {
+    try {
+      const container = await leaderboardContainer(interaction.guild);
+      return await interaction.reply({ components: [container], flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [] } });
+    } catch (err) {
+      console.error('leaderboard V2 gagal, pakai embed biasa:', err.message);
+    }
+  }
+  return interaction.reply({ embeds: [leaderboardEmbed(interaction.guild)], allowedMentions: { parse: [] } });
+}
+// ============ akhir /level dan /leaderboard ============
 
 // ============ lock & unlock channel ============
 function isServerAdmin(interaction) {
@@ -982,6 +1130,123 @@ async function afkHandle(message) {
 }
 // ============ akhir AFK ============
 
+// ============ deobfuscate (format ALLZRA dari obfu-file / obfu-link) ============
+// Membalik skema obfuscate di atas: ambil _CHUNKS, _K, dan _EXPECT dari file, lalu decode.
+// Ini jalur statis khusus format ALLZRA. Format lain ditangani lua-tools.js (peel statis dan sandbox).
+function deobfuscateLua(text) {
+  const chunksBlock = text.match(/local _CHUNKS = \{([\s\S]*?)\n\}/);
+  const keyBlock = text.match(/local _K = \{([^}]*)\}/);
+  const expectMatch = text.match(/local _EXPECT = (\d+)/);
+  if (!chunksBlock || !keyBlock || !expectMatch) {
+    throw new Error('bukan file format ALLZRA (_CHUNKS, _K, atau _EXPECT tidak ditemukan)');
+  }
+  const chunks = [...chunksBlock[1].matchAll(/"([0-9a-fA-F]*)"/g)].map((m) => m[1]);
+  const key = keyBlock[1].split(',').map((x) => Number.parseInt(x.trim(), 10));
+  if (chunks.length === 0 || key.length === 0 || key.some((k) => !Number.isInteger(k) || k < 0 || k > 255)) {
+    throw new Error('isi _CHUNKS atau _K tidak valid');
+  }
+  if (chunks.some((c) => c.length % 2 !== 0)) throw new Error('ada chunk hex dengan panjang ganjil, file rusak');
+  const expect = Number.parseInt(expectMatch[1], 10);
+  const out = decodeBytes(chunks, key);
+  if (out.length !== expect) throw new Error(`hasil decode ${out.length} byte, seharusnya ${expect} byte`);
+  return out;
+}
+
+const DEOBFU_ENGINE_LABEL = {
+  allzra: 'ALLZRA (statis)',
+  peel: 'Peel loadstring (statis)',
+  sandbox: 'Sandbox dinamis (fengari)',
+};
+
+function deobfuResultEmbed(interaction, inputBytes, result, elapsedMs) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_OBFU)
+    .setAuthor({ name: result.primary ? 'Deobfuscate Successful' : 'Deobfuscate: Hanya Log', iconURL: client.user.displayAvatarURL() })
+    .setDescription(result.engine === 'allzra'
+      ? `${cfg.brandName} — membalik obfuscate format ALLZRA.`
+      : `${cfg.brandName} — deobfuscate lewat ${DEOBFU_ENGINE_LABEL[result.engine]}.`)
+    .addFields(
+      { name: 'Ukuran Terobfus', value: `${inputBytes} byte`, inline: true },
+      { name: 'Ukuran Hasil', value: result.primary ? `${result.primary.length} byte` : 'tidak ada (hanya log)', inline: true },
+      { name: 'Waktu Proses', value: `${(elapsedMs / 1000).toFixed(2)}s`, inline: true },
+      { name: 'Engine', value: DEOBFU_ENGINE_LABEL[result.engine], inline: true },
+    );
+  if (result.notes.length > 0) {
+    embed.addFields({ name: 'Catatan', value: result.notes.map((n) => `• ${n}`).join('\n').slice(0, 1000) });
+  }
+  return embed
+    .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
+    .setTimestamp();
+}
+
+function deobfuFailEmbed(interaction, note) {
+  return new EmbedBuilder()
+    .setColor(COLOR_FAIL)
+    .setAuthor({ name: 'Deobfuscate Failed', iconURL: client.user.displayAvatarURL() })
+    .setDescription(String(note).slice(0, 1500))
+    .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
+    .setTimestamp();
+}
+
+function deobfuFiles(result, baseName, primaryName) {
+  const files = [];
+  if (result.primary) files.push(new AttachmentBuilder(result.primary, { name: primaryName }));
+  for (const ex of result.extras) files.push(new AttachmentBuilder(ex.data, { name: `${baseName}.${ex.suffix}` }));
+  return files;
+}
+
+// Jalur bersama deobfu-file dan deobfu-link. engine kosong = auto: ALLZRA, peel statis, lalu sandbox.
+async function runDeobfu(interaction, buf, baseName, primaryName, started) {
+  const engine = interaction.options.getString('engine') ?? 'auto';
+  try {
+    if (engine === 'sandbox' && !cfg.sandbox.enabled) throw new Error('sandbox dinonaktifkan (SANDBOX_ENABLED=false)');
+    const result = await luaTools.deobfuscateWith(engine, buf, {
+      allzra: deobfuscateLua,
+      sandbox: cfg.sandbox,
+      sandboxInAuto: cfg.sandbox.enabled && cfg.sandbox.inAuto,
+    });
+    await interaction.editReply({
+      embeds: [deobfuResultEmbed(interaction, buf.length, result, Date.now() - started)],
+      files: deobfuFiles(result, baseName, primaryName),
+    });
+  } catch (err) {
+    await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, err.message || String(err))] });
+  }
+}
+
+async function handleDeobfuFile(interaction) {
+  await interaction.deferReply();
+  const attachment = interaction.options.getAttachment('file', true);
+  if (attachment.size > cfg.obfu.maxSourceBytes) {
+    return interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${cfg.obfu.maxSourceBytes} byte.`)] });
+  }
+  const started = Date.now();
+  let buf;
+  try {
+    const res = await fetch(attachment.url, { signal: AbortSignal.timeout(cfg.obfu.requestTimeoutMs) });
+    if (!res.ok) throw new Error(`gagal mengambil attachment (HTTP ${res.status})`);
+    buf = Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    return interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `Gagal membaca file: ${err.message || err.name}`)] });
+  }
+  const baseName = attachment.name.replace(/\.obf\.lua$/i, '').replace(/\.lua$/i, '');
+  return runDeobfu(interaction, buf, baseName, `${baseName}.deobf.lua`, started);
+}
+
+async function handleDeobfuLink(interaction) {
+  await interaction.deferReply();
+  const url = interaction.options.getString('url', true);
+  const started = Date.now();
+  let buf;
+  try {
+    buf = await fetchTextSafe(url, { maxBytes: cfg.obfu.maxSourceBytes, timeoutMs: cfg.obfu.requestTimeoutMs });
+  } catch (err) {
+    return interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `Gagal mengambil link: ${err.message}`)] });
+  }
+  return runDeobfu(interaction, buf, 'deobfuscated', 'deobfuscated.lua', started);
+}
+// ============ akhir deobfuscate ============
+
 // ============ bot ============
 warnIfSecretsInRepoFiles();
 const cfg = loadConfig();
@@ -996,20 +1261,45 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // welcome/goodbye & invite log: aktifkan "Server Members Intent"
     GatewayIntentBits.GuildInvites, // invite log: lacak invite dan pemakaiannya
     GatewayIntentBits.GuildMessages, // XP dari chat
-    GatewayIntentBits.MessageContent, // baca teks "ALLZXRAA level" / "Alevel" / "Alb": aktifkan "Message Content Intent"
+    GatewayIntentBits.MessageContent, // tidak lagi dipakai untuk level/lb (sekarang /level dan /leaderboard); boleh dihapus kalau tidak butuh baca isi pesan
   ],
 });
 
+
+const obfuEngineOption = (o) => o.setName('engine').setDescription('Mesin obfuscate (kosong = ALLZRA bawaan)')
+  .addChoices(
+    { name: 'ALLZRA (bawaan)', value: 'allzra' },
+    { name: 'Luraph (butuh API key)', value: 'luraph' },
+    { name: 'Prometheus (butuh install lokal)', value: 'prometheus' },
+  );
+const deobfuEngineOption = (o) => o.setName('engine').setDescription('Metode deobfuscate (kosong = auto)')
+  .addChoices(
+    { name: 'Auto (ALLZRA, peel, lalu sandbox)', value: 'auto' },
+    { name: 'ALLZRA (statis)', value: 'allzra' },
+    { name: 'Peel loadstring literal (statis)', value: 'peel' },
+    { name: 'Sandbox dinamis (jalankan terisolasi)', value: 'sandbox' },
+  );
 
 const commands = [
   new SlashCommandBuilder()
     .setName('obfu-file')
     .setDescription('Obfuscate file .lua (format sama seperti ALLZRA_main.lua)')
-    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true)),
+    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true))
+    .addStringOption(obfuEngineOption),
   new SlashCommandBuilder()
     .setName('obfu-link')
     .setDescription('Obfuscate isi dari link raw ke format .lua terproteksi')
-    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true)),
+    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true))
+    .addStringOption(obfuEngineOption),
+  new SlashCommandBuilder()
+    .setName('level')
+    .setDescription('Lihat level dan XP kamu (atau member lain)')
+    .addUserOption((o) => o.setName('user').setDescription('Member lain (kosong = kamu)'))
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('leaderboard')
+    .setDescription('Lihat leaderboard level server ini')
+    .setDMPermission(false),
   new SlashCommandBuilder()
     .setName('level-role')
     .setDescription('Atur role hadiah tiap level')
@@ -1040,6 +1330,16 @@ const commands = [
       .addUserOption((o) => o.setName('user').setDescription('Member lain (kosong = kamu)')))
     .addSubcommand((sub) => sub.setName('list').setDescription('Lihat siapa yang sedang AFK di server ini'))
     .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('deobfu-file')
+    .setDescription('Deobfuscate file .lua (ALLZRA, peel loadstring, atau sandbox dinamis)')
+    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua hasil obfuscate').setRequired(true))
+    .addStringOption(deobfuEngineOption),
+  new SlashCommandBuilder()
+    .setName('deobfu-link')
+    .setDescription('Deobfuscate link raw .lua (ALLZRA, peel loadstring, atau sandbox dinamis)')
+    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi file hasil obfuscate').setRequired(true))
+    .addStringOption(deobfuEngineOption),
 ];
 
 client.once(Events.ClientReady, async (c) => {
@@ -1049,6 +1349,9 @@ client.once(Events.ClientReady, async (c) => {
   if (!cfg.welcomeChannelId) console.warn('welcome: WELCOME_CHANNEL_ID belum di-set, fitur welcome nonaktif');
   if (!cfg.goodbyeChannelId) console.warn('goodbye: GOODBYE_CHANNEL_ID belum di-set, fitur goodbye nonaktif');
   if (!cfg.inviteLogChannelId) console.warn('invite: INVITE_LOG_CHANNEL_ID belum di-set, invite log tidak diposting (hitungan tetap dicatat)');
+  if (!cfg.luraph.apiKey) console.warn('luraph: LURAPH_API_KEY belum di-set, engine luraph nonaktif');
+  if (!cfg.prometheus.dir) console.warn('prometheus: PROMETHEUS_DIR belum di-set, engine prometheus nonaktif');
+  if (cfg.sandbox.enabled && !luaTools.sandboxAvailable()) console.warn('sandbox: paket fengari belum terpasang (npm install fengari), deobfuscate sandbox nonaktif');
 });
 
 client.on(Events.GuildCreate, (guild) => {
@@ -1092,22 +1395,9 @@ client.on(Events.MessageCreate, async (message) => {
     if (gain?.leveledUp) {
       const granted = await applyLevelRoles(message.guild, message.author.id, gain.level);
       await message.channel.send({
-        content: `${message.author}`,
         embeds: [levelUpEmbed(message.author, gain.level, granted)],
-        allowedMentions: { users: [message.author.id] },
+        allowedMentions: { parse: [] },
       }).catch((err) => console.error('gagal kirim level up:', err.message));
-    }
-    const text = message.content.trim();
-    if (LEVEL_TRIGGER.test(text)) {
-      await message.reply({
-        embeds: [levelCardEmbed(message.author, message.guild.id)],
-        allowedMentions: { repliedUser: false },
-      });
-    } else if (LEADERBOARD_TRIGGER.test(text)) {
-      await message.reply({
-        embeds: [leaderboardEmbed(message.guild)],
-        allowedMentions: { repliedUser: false },
-      });
     }
   } catch (err) {
     console.error('message handler error:', err);
@@ -1122,6 +1412,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleObfuFile(interaction);
     } else if (interaction.commandName === 'obfu-link') {
       await handleObfuLink(interaction);
+    } else if (interaction.commandName === 'level') {
+      await handleLevel(interaction);
+    } else if (interaction.commandName === 'leaderboard') {
+      await handleLeaderboard(interaction);
     } else if (interaction.commandName === 'level-role') {
       await handleLevelRole(interaction);
     } else if (interaction.commandName === 'lock') {
@@ -1130,6 +1424,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleUnlock(interaction);
     } else if (interaction.commandName === 'afk') {
       await handleAfk(interaction);
+    } else if (interaction.commandName === 'deobfu-file') {
+      await handleDeobfuFile(interaction);
+    } else if (interaction.commandName === 'deobfu-link') {
+      await handleDeobfuLink(interaction);
     }
   } catch (err) {
     console.error('interaction error:', err);
@@ -1155,8 +1453,8 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err));
 
 module.exports = {
-  obfuscate, decodeBytes, levelInfo, progressBar, awardXp, guildRanking,
-  LEVEL_TRIGGER, LEADERBOARD_TRIGGER, users, inviteCache, inviteCounts, joinedBy,
+  obfuscate, obfuscateWith, deobfuscateLua, handleObfuFile, handleDeobfuFile, decodeBytes, levelInfo, progressBar, awardXp, guildRanking,
+  handleLevel, handleLeaderboard, awardXp, users, inviteCache, inviteCounts, joinedBy,
   detectInviter, cacheInvites, handleInviteJoin, handleInviteLeave, saveAll,
   loadConfig, fetchTextSafe,
 };
