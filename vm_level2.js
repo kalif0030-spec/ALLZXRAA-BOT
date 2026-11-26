@@ -45,12 +45,24 @@ function encodeProgram(program, consts, seed) {
   return { bytes, key, perm, consts };
 }
 
+// Konstanta jadi literal Lua. Angka apa adanya. String ditulis dengan escape desimal per byte,
+// jadi aman untuk karakter khusus, newline, dan UTF-8.
+function luaConst(v) {
+  if (typeof v === 'number') return String(v);
+  const bytes = Buffer.from(String(v), 'utf8');
+  let out = '"';
+  for (const b of bytes) {
+    out += (b >= 32 && b < 127 && b !== 34 && b !== 92) ? String.fromCharCode(b) : '\\' + b;
+  }
+  return out + '"';
+}
+
 function luaString(obj) {
   const names = OPS.map((o) => `P_${o}`).join(',');
   const values = OPS.map((o) => obj.perm[o]).join(',');
   return `local ENC={${obj.bytes.join(',')}}
 local KEY={${obj.key.join(',')}}
-local CONST={${obj.consts.join(',')}}
+local CONST={${obj.consts.map(luaConst).join(',')}}
 local ${names}=${values}
 local R={}
 local STK={}
@@ -128,4 +140,4 @@ function listing(ins, consts) {
   }).join('\n');
 }
 
-module.exports = { FIELDS, OPS, makePerm, makeKey, encodeProgram, luaString, disassemble, listing };
+module.exports = { luaConst, FIELDS, OPS, makePerm, makeKey, encodeProgram, luaString, disassemble, listing };

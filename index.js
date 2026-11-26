@@ -17,7 +17,7 @@ const {
 const {
   ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder,
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
-  ChannelType, MessageFlags, PermissionFlagsBits, SlashCommandBuilder,
+  ChannelType, MessageFlags, PermissionFlagsBits, SlashCommandBuilder, Partials,
 } = require('discord.js');
 // Setiap balasan bot dapat kartu gambar (lihat info_cards.js). Tanpa @napi-rs/canvas, ini dilewati.
 require('./info_cards').install({ cards, discord: require('discord.js') });
@@ -25,13 +25,37 @@ require('./info_cards').install({ cards, discord: require('discord.js') });
 // ============ konstanta ============
 const COLOR_WELCOME = 0x57f287;
 const COLOR_GOODBYE = 0xed4245;
-const COLOR_OBFU = 0x5865f2;
 const COLOR_LEVEL = 0xfee75c;
 const COLOR_INVITE = 0x5865f2;
 const COLOR_FAIL = 0xed4245;
 const COLOR_INFO = 0x5865f2;
 
 const CONFIG_FILE = path.join(__dirname, 'config.json');
+
+// Pemisahan bot: BOT_ROLE = level | welcome | obfu, satu proses per bot dengan token sendiri.
+// Tanpa BOT_ROLE (atau all) semua fitur jalan dalam satu proses, seperti sebelumnya.
+const BOT_ROLE = (process.env.BOT_ROLE || 'all').toLowerCase();
+if (!['all', 'level', 'welcome', 'obfu', 'reaction'].includes(BOT_ROLE)) {
+  throw new Error(`BOT_ROLE tidak dikenal: ${BOT_ROLE}. Pakai level, welcome, obfu, atau kosongkan.`);
+}
+const runs = (feature) => BOT_ROLE === 'all' || BOT_ROLE === feature;
+// Pemetaan command ke fitur. lock/unlock ikut welcome (manajemen server bersama join/leave/invite).
+const COMMAND_FEATURE = {
+  level: 'level',
+  leaderboard: 'level',
+  'level-role': 'level',
+  'xp-event': 'level',
+  'xp-rate': 'level',
+  'xp-only': 'level',
+  afk: 'level',
+  'afk-admin': 'level',
+  lock: 'welcome',
+  unlock: 'welcome',
+  'obfu-file': 'obfu',
+  'obfu-link': 'obfu',
+  'reaction-role': 'reaction',
+  voice: 'welcome',
+};
 const XP_DATA_FILE = path.join(__dirname, 'xp-data.json');
 const INVITE_DATA_FILE = path.join(__dirname, 'invite-data.json');
 
@@ -88,9 +112,16 @@ function loadConfig() {
   const local = readLocalConfig();
   const pick = (envName, key) => process.env[envName] ?? local[key];
 
-  const token = process.env.DISCORD_TOKEN || process.env.TOKEN || process.env.BOT_TOKEN || local.token;
-  if (!token) {
-    throw new Error('Token belum di-set: isi env DISCORD_TOKEN (atau TOKEN / BOT_TOKEN) atau buat config.json berisi {"token": "..."}');
+  // Mode per-bot: env TOKEN_<ROLE> dulu, lalu config.json "tokens": { "<role>": "..." }.
+  // Mode satu proses: env DISCORD_TOKEN/TOKEN/BOT_TOKEN, lalu config.json "token".
+  const localTokens = local.tokens && typeof local.tokens === 'object' ? local.tokens : {};
+  const token = BOT_ROLE === 'all'
+    ? (process.env.DISCORD_TOKEN || process.env.TOKEN || process.env.BOT_TOKEN || local.token)
+    : (process.env[`TOKEN_${BOT_ROLE.toUpperCase()}`] || localTokens[BOT_ROLE]);
+  if (!token || (typeof token === 'string' && token.startsWith('ISI_'))) {
+    throw new Error(BOT_ROLE === 'all'
+      ? 'Token belum di-set: isi env DISCORD_TOKEN (atau TOKEN / BOT_TOKEN) atau isi "token" di config.json'
+      : `Token belum di-set untuk BOT_ROLE=${BOT_ROLE}: isi env TOKEN_${BOT_ROLE.toUpperCase()} atau "tokens.${BOT_ROLE}" di config.json`);
   }
 
   return Object.freeze({
@@ -305,14 +336,59 @@ function loadXpStore() {
 
 const xpSaver = createSaver(XP_DATA_FILE, () => ({ users: Object.fromEntries(users) }));
 
-// Anti-spam: cuma dapat XP sekali per cfg.xp.cooldownMs per user per server.
+// ============ pengaturan XP per server (admin) ============
+// Event XP ganda dan besar XP/cooldown bisa diubah lewat /xp-event dan /xp-rate. Yang tidak diisi memakai cfg.xp.
+const XP_SETTINGS_FILE = path.join(__dirname, 'xp-settings.json');
+const XP_EVENT_MAX_MULTIPLIER = 10;
+const XP_EVENT_MAX_HOURS = 168;
+const XP_RATE_MAX = 1000;
+const XP_COOLDOWN_MAX_SECONDS = 3600;
+const xpSettings = new Map(); // guildId -> { multiplier?, eventEndsAt?, min?, max?, cooldownMs? }
+
+function loadXpSettings() {
+  const raw = readJsonFile(XP_SETTINGS_FILE);
+  if (!raw || typeof raw.guilds !== 'object' || raw.guilds === null) return;
+  for (const [guildId, v] of Object.entries(raw.guilds)) {
+    if (!v || typeof v !== 'object') continue;
+    const entry = {};
+    if (Number.isInteger(v.multiplier) && v.multiplier >= 2 && v.multiplier <= XP_EVENT_MAX_MULTIPLIER) entry.multiplier = v.multiplier;
+    if (Number.isFinite(v.eventEndsAt) && v.eventEndsAt > 0) entry.eventEndsAt = v.eventEndsAt;
+    if (Number.isInteger(v.min) && Number.isInteger(v.max) && v.min >= 1 && v.max >= v.min && v.max <= XP_RATE_MAX) {
+      entry.min = v.min;
+      entry.max = v.max;
+    }
+    if (Number.isInteger(v.cooldownMs) && v.cooldownMs >= 1000 && v.cooldownMs <= XP_COOLDOWN_MAX_SECONDS * 1000) {
+      entry.cooldownMs = v.cooldownMs;
+    }
+    if (Object.keys(entry).length > 0) xpSettings.set(guildId, entry);
+  }
+}
+
+const xpSettingsSaver = createSaver(XP_SETTINGS_FILE, () => ({ guilds: Object.fromEntries(xpSettings) }));
+
+// Aturan efektif untuk satu server saat ini. Event yang sudah lewat waktunya dianggap tidak aktif.
+function xpRulesFor(guildId, now = Date.now()) {
+  const s = xpSettings.get(guildId) || {};
+  const eventActive = Boolean(s.multiplier && s.eventEndsAt && s.eventEndsAt > now);
+  return {
+    min: s.min ?? cfg.xp.min,
+    max: s.max ?? cfg.xp.max,
+    cooldownMs: s.cooldownMs ?? cfg.xp.cooldownMs,
+    multiplier: eventActive ? s.multiplier : 1,
+    eventEndsAt: eventActive ? s.eventEndsAt : null,
+  };
+}
+
+// Anti-spam: cuma dapat XP sekali per cooldown per user per server.
 // Mengembalikan null kalau masih cooldown. Kalau dapat XP, kembalikan { leveledUp, level }.
 function awardXp(guildId, userId, now = Date.now()) {
   const key = `${guildId}:${userId}`;
   const entry = users.get(key) || { xp: 0, lastAt: 0 };
-  if (now - entry.lastAt < cfg.xp.cooldownMs) return null;
+  const rules = xpRulesFor(guildId, now);
+  if (now - entry.lastAt < rules.cooldownMs) return null;
   const before = levelInfo(entry.xp).level;
-  entry.xp += cfg.xp.min + crypto.randomInt(cfg.xp.max - cfg.xp.min + 1);
+  const base = rules.min + crypto.randomInt(rules.max - rules.min + 1);
+  entry.xp += base * rules.multiplier;
   entry.lastAt = now;
   users.set(key, entry);
   xpSaver.schedule();
@@ -512,14 +588,28 @@ function detectInviter(guildId, fresh) {
   return null;
 }
 
-async function postInviteLog(guild, embed) {
+// Invite log: embed seperti biasa, dan kartu galaksi dikirim sebagai lampiran terpisah (bukan di dalam embed).
+async function postInviteLog(guild, embed, card) {
   if (!cfg.inviteLogChannelId) return;
   const channel = await guild.channels.fetch(cfg.inviteLogChannelId).catch(() => null);
   if (!channel || !channel.isTextBased()) {
     console.warn(`invite: channel ${cfg.inviteLogChannelId} tidak ditemukan atau bukan channel teks`);
     return;
   }
-  await channel.send({ embeds: [embed] }).catch((err) => console.error('gagal kirim invite log:', err));
+  const payload = { embeds: [embed] };
+  if (cards.isAvailable()) {
+    try {
+      const png = await cards.renderInfoCard({
+        title: card.title,
+        subtitle: card.subtitle,
+        accent: '#' + COLOR_INVITE.toString(16).padStart(6, '0'),
+      });
+      payload.files = [new AttachmentBuilder(png, { name: 'invite.png' })];
+    } catch (err) {
+      console.error('kartu invite gagal, kirim embed saja:', err.message);
+    }
+  }
+  await channel.send(payload).catch((err) => console.error('gagal kirim invite log:', err));
 }
 
 function inviteJoinEmbed(member, found, invitedCount, leftCount) {
@@ -606,7 +696,15 @@ async function handleInviteJoin(member) {
     invitedCount = c.invited;
     leftCount = c.left;
   }
-  await postInviteLog(guild, inviteJoinEmbed(member, found && found.inviterId !== member.id ? found : null, invitedCount, leftCount));
+  const joinFound = found && found.inviterId !== member.id ? found : null;
+  await postInviteLog(
+    guild,
+    inviteJoinEmbed(member, joinFound, invitedCount, leftCount),
+    {
+      title: `${cardName(member.user)} bergabung`,
+      subtitle: joinFound ? `Diundang oleh ${joinFound.inviterTag}` : 'Pengundang tidak diketahui',
+    },
+  );
 }
 
 async function handleInviteLeave(member) {
@@ -619,7 +717,10 @@ async function handleInviteLeave(member) {
   c.left += 1;
   inviteCounts.set(ck, c);
   inviteSaver.schedule();
-  await postInviteLog(member.guild, inviteLeaveEmbed(member, rec, c.invited, c.left));
+  await postInviteLog(member.guild, inviteLeaveEmbed(member, rec, c.invited, c.left), {
+    title: `${cardName(member.user)} keluar`,
+    subtitle: `Sisa member: ${member.guild.memberCount}`,
+  });
 }
 
 // Serialisasi per server supaya dua join yang datang bersamaan tidak saling menghitung dobel.
@@ -664,12 +765,9 @@ async function sendWelcome(member) {
         name: cardName(member.user),
         memberCount: member.guild.memberCount,
       });
-      const embed = new EmbedBuilder()
-        .setColor(COLOR_WELCOME)
-        .setDescription(`## Selamat datang ${member} di **${member.guild.name}**!\nSemoga betah ya, kamu member ke-${member.guild.memberCount}.`)
-        .setImage('attachment://welcome.png');
+      // Teks (dengan mention) di atas gambar, tanpa embed.
       await channel.send({
-        embeds: [embed],
+        content: `## Selamat datang ${member} di **${member.guild.name}**!\nSemoga betah ya, kamu member ke-${member.guild.memberCount}.`,
         files: [new AttachmentBuilder(png, { name: 'welcome.png' })],
         allowedMentions: { parse: [] },
       });
@@ -723,27 +821,53 @@ async function sendGoodbye(member) {
   await channel.send({ embeds: [embed] }).catch((err) => console.error('gagal kirim goodbye:', err));
 }
 
-function obfuResultEmbed(interaction, mode, originalBytes, outputBytes, elapsedMs) {
-  return new EmbedBuilder()
-    .setColor(COLOR_OBFU)
-    .setAuthor({ name: 'Obfuscate Successful', iconURL: client.user.displayAvatarURL() })
-    .setDescription(`${cfg.brandName} — mode obfuscate: ${MODE_CHOICES.find((choice) => choice.value === mode)?.name || mode}.`)
-    .addFields(
-      { name: 'Ukuran Asli', value: `${originalBytes} byte`, inline: true },
-      { name: 'Ukuran Hasil', value: `${outputBytes} byte`, inline: true },
-      { name: 'Waktu Proses', value: `${(elapsedMs / 1000).toFixed(2)}s`, inline: true }
-    )
-    .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
-    .setTimestamp();
+function obfuscateWithFallback(buf, cfg, mode) {
+  try {
+    return { out: Buffer.from(obfuscate(buf, cfg, mode), 'utf8'), usedMode: mode, fallbackReason: null };
+  } catch (err) {
+    // vm2 hanya menerima subset Lua dan batas 256 instruksi. Script di luar itu jatuh ke allzxraa (Lua penuh).
+    if (mode !== 'vm2') throw err;
+    const reason = err.message || String(err);
+    return { out: Buffer.from(obfuscate(buf, cfg, 'allzxraa'), 'utf8'), usedMode: 'allzxraa', fallbackReason: reason };
+  }
 }
 
-function obfuFailEmbed(interaction, note) {
-  return new EmbedBuilder()
-    .setColor(COLOR_FAIL)
-    .setAuthor({ name: 'Obfuscate Failed', iconURL: client.user.displayAvatarURL() })
-    .setDescription(String(note).slice(0, 1500))
-    .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
-    .setTimestamp();
+// Balasan obfuscate dikirim sebagai teks biasa; info_cards.js mengubahnya jadi kartu gambar tanpa embed.
+// Kartu hasil obfuscate memakai avatar dan nama pemohon seperti kartu /level. Kalau renderer tidak ada,
+// dikirim teks biasa (info_cards.js lalu mengubahnya jadi kartu gambar).
+async function obfuPayload(interaction, { ok, title, lines, files = [] }) {
+  const payload = { content: '', embeds: [], files: [...files] };
+  if (cards.isAvailable()) {
+    try {
+      const png = await cards.renderObfuCard({
+        avatarUrl: cardAvatarUrl(interaction.user),
+        requester: cardName(interaction.user),
+        ok,
+        title,
+        lines,
+      });
+      payload.files.unshift(new AttachmentBuilder(png, { name: 'obfu.png' }));
+      return payload;
+    } catch (err) {
+      console.error('obfu card gagal, kirim teks:', err.message);
+    }
+  }
+  payload.content = [title, ...lines, `Request by ${cardName(interaction.user)}`].join('\n');
+  return payload;
+}
+
+async function obfuSuccessMessage(interaction, usedMode, originalBytes, outputBytes, elapsedMs, fallbackReason, files) {
+  const modeName = MODE_CHOICES.find((choice) => choice.value === usedMode)?.name || usedMode;
+  const lines = [
+    `${cfg.brandName} — mode obfuscate: ${modeName}.`,
+    `Ukuran Asli ${originalBytes} byte • Ukuran Hasil ${outputBytes} byte • Waktu ${(elapsedMs / 1000).toFixed(2)}s`,
+  ];
+  if (fallbackReason) lines.push(`vm2 menolak script ini (${fallbackReason}), dipakai allzxraa.`);
+  return obfuPayload(interaction, { ok: true, title: 'Obfuscate Successful', lines, files });
+}
+
+async function obfuFailMessage(interaction, note) {
+  return obfuPayload(interaction, { ok: false, title: 'Obfuscate Failed', lines: [String(note).slice(0, 300)] });
 }
 
 async function handleObfuFile(interaction) {
@@ -751,7 +875,7 @@ async function handleObfuFile(interaction) {
   const attachment = interaction.options.getAttachment('file', true);
   const mode = OBFU_MODE; // satu-satunya mode: VM asli (vm2), tanpa pilihan lain
   if (attachment.size > cfg.obfu.maxSourceBytes) {
-    await interaction.editReply({ embeds: [obfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${cfg.obfu.maxSourceBytes} byte.`)] });
+    await interaction.editReply(await obfuFailMessage(interaction, `File terlalu besar: ${attachment.size} byte > batas ${cfg.obfu.maxSourceBytes} byte.`));
     return;
   }
   const started = Date.now();
@@ -761,18 +885,15 @@ async function handleObfuFile(interaction) {
     if (!res.ok) throw new Error(`gagal mengambil attachment (HTTP ${res.status})`);
     buf = Buffer.from(await res.arrayBuffer());
   } catch (err) {
-    await interaction.editReply({ embeds: [obfuFailEmbed(interaction, `Gagal membaca file: ${err.message || err.name}`)] });
+    await interaction.editReply(await obfuFailMessage(interaction, `Gagal membaca file: ${err.message || err.name}`));
     return;
   }
   try {
-    const outBuf = Buffer.from(obfuscate(buf, cfg, mode), 'utf8');
+    const { out: outBuf, usedMode, fallbackReason } = obfuscateWithFallback(buf, cfg, mode);
     const name = attachment.name.replace(/\.lua$/i, '') + '.obf.lua';
-    await interaction.editReply({
-      embeds: [obfuResultEmbed(interaction, mode, buf.length, outBuf.length, Date.now() - started)],
-      files: [new AttachmentBuilder(outBuf, { name })],
-    });
+    await interaction.editReply(await obfuSuccessMessage(interaction, usedMode, buf.length, outBuf.length, Date.now() - started, fallbackReason, [new AttachmentBuilder(outBuf, { name })]));
   } catch (err) {
-    await interaction.editReply({ embeds: [obfuFailEmbed(interaction, err.message || String(err))] });
+    await interaction.editReply(await obfuFailMessage(interaction, err.message || String(err)));
   }
 }
 
@@ -785,17 +906,14 @@ async function handleObfuLink(interaction) {
   try {
     buf = await fetchTextSafe(url, { maxBytes: cfg.obfu.maxSourceBytes, timeoutMs: cfg.obfu.requestTimeoutMs });
   } catch (err) {
-    await interaction.editReply({ embeds: [obfuFailEmbed(interaction, `Gagal mengambil link: ${err.message}`)] });
+    await interaction.editReply(await obfuFailMessage(interaction, `Gagal mengambil link: ${err.message}`));
     return;
   }
   try {
-    const outBuf = Buffer.from(obfuscate(buf, cfg, mode), 'utf8');
-    await interaction.editReply({
-      embeds: [obfuResultEmbed(interaction, mode, buf.length, outBuf.length, Date.now() - started)],
-      files: [new AttachmentBuilder(outBuf, { name: 'obfuscated.lua' })],
-    });
+    const { out: outBuf, usedMode, fallbackReason } = obfuscateWithFallback(buf, cfg, mode);
+    await interaction.editReply(await obfuSuccessMessage(interaction, usedMode, buf.length, outBuf.length, Date.now() - started, fallbackReason, [new AttachmentBuilder(outBuf, { name: 'obfuscated.lua' })]));
   } catch (err) {
-    await interaction.editReply({ embeds: [obfuFailEmbed(interaction, err.message || String(err))] });
+    await interaction.editReply(await obfuFailMessage(interaction, err.message || String(err)));
   }
 }
 
@@ -998,6 +1116,11 @@ function isServerAdmin(interaction) {
     || Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.Administrator));
 }
 
+// Khusus owner server: dipakai untuk /xp-event dan /xp-rate.
+function isServerOwner(interaction) {
+  return interaction.guild.ownerId === interaction.user.id;
+}
+
 async function setChannelLock(interaction, locked) {
   if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
   if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
@@ -1141,6 +1264,83 @@ function botCanEditChannel(channel) {
   return !!me && channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels]);
 }
 
+function fmtWib(ms) {
+  return new Date(ms).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', dateStyle: 'medium', timeStyle: 'short' }) + ' WIB';
+}
+
+function xpAdminDenied(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerOwner(interaction)) return interaction.reply({ content: 'Cuma owner server yang bisa atur XP.', flags: MessageFlags.Ephemeral });
+  return null;
+}
+
+async function handleXpEvent(interaction) {
+  const denied = xpAdminDenied(interaction);
+  if (denied) return denied;
+  const guildId = interaction.guild.id;
+  const sub = interaction.options.getSubcommand();
+  const now = Date.now();
+
+  if (sub === 'start') {
+    const multiplier = interaction.options.getInteger('multiplier', true);
+    const hours = interaction.options.getInteger('jam', true);
+    const endsAt = now + hours * 3600 * 1000;
+    xpSettings.set(guildId, { ...(xpSettings.get(guildId) || {}), multiplier, eventEndsAt: endsAt });
+    xpSettingsSaver.save();
+    return interaction.reply({ content: `Event XP x${multiplier} aktif selama ${hours} jam, sampai ${fmtWib(endsAt)}.`, allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'stop') {
+    const current = xpSettings.get(guildId) || {};
+    const { multiplier, eventEndsAt, ...rest } = current;
+    if (Object.keys(rest).length > 0) xpSettings.set(guildId, rest); else xpSettings.delete(guildId);
+    xpSettingsSaver.save();
+    return interaction.reply({ content: 'Event XP dihentikan. XP kembali normal.', allowedMentions: { parse: [] } });
+  }
+
+  // status
+  const rules = xpRulesFor(guildId, now);
+  const text = rules.eventEndsAt
+    ? `Event XP x${rules.multiplier} aktif sampai ${fmtWib(rules.eventEndsAt)}.`
+    : 'Tidak ada event XP yang aktif sekarang.';
+  return interaction.reply({ content: text, allowedMentions: { parse: [] } });
+}
+
+async function handleXpRate(interaction) {
+  const denied = xpAdminDenied(interaction);
+  if (denied) return denied;
+  const guildId = interaction.guild.id;
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'set') {
+    const min = interaction.options.getInteger('min', true);
+    const max = interaction.options.getInteger('max', true);
+    const cooldownSec = interaction.options.getInteger('cooldown');
+    if (max < min) {
+      return interaction.reply({ content: `Maksimum (${max}) tidak boleh lebih kecil dari minimum (${min}).`, flags: MessageFlags.Ephemeral });
+    }
+    const current = xpSettings.get(guildId) || {};
+    const next = { ...current, min, max };
+    if (cooldownSec !== null) next.cooldownMs = cooldownSec * 1000;
+    xpSettings.set(guildId, next);
+    xpSettingsSaver.save();
+    const rules = xpRulesFor(guildId);
+    return interaction.reply({ content: `XP per pesan: ${rules.min}-${rules.max}. Cooldown: ${rules.cooldownMs / 1000} detik.`, allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'reset') {
+    const current = xpSettings.get(guildId) || {};
+    const { min, max, cooldownMs, ...rest } = current;
+    if (Object.keys(rest).length > 0) xpSettings.set(guildId, rest); else xpSettings.delete(guildId);
+    xpSettingsSaver.save();
+    return interaction.reply({ content: 'XP per pesan dan cooldown dikembalikan ke bawaan.', allowedMentions: { parse: [] } });
+  }
+
+  // status
+  const rules = xpRulesFor(guildId);
+  return interaction.reply({ content: `XP per pesan: ${rules.min}-${rules.max}. Cooldown: ${rules.cooldownMs / 1000} detik.`, allowedMentions: { parse: [] } });
+}
+
 function xpOnlyPlan(guild) {
   const everyone = guild.roles.everyone;
   const plan = { toLock: [], skipped: [] };
@@ -1167,6 +1367,7 @@ function listChannels(channels, max = 25) {
 
 async function handleXpOnly(interaction) {
   if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pakai command ini.', flags: MessageFlags.Ephemeral });
   if (!cfg.xpChannelId) {
     return interaction.reply({ content: 'Isi `xpChannelId` (env LEVEL_XP_CHANNEL_ID) dulu, bot perlu tahu channel XP.', flags: MessageFlags.Ephemeral });
   }
@@ -1193,20 +1394,357 @@ async function handleXpOnly(interaction) {
 warnIfSecretsInRepoFiles();
 const cfg = loadConfig();
 loadXpStore();
+loadXpSettings();
 loadInviteStore();
 loadLevelRoles();
 loadAfk();
 
+const ROLE_INTENTS = {
+  level: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  welcome: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildVoiceStates],
+  obfu: [GatewayIntentBits.Guilds],
+  reaction: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessageReactions],
+};
+
 const client = new Client({
-  intents: [
+  // Partials: reaction pada pesan lama dan di luar cache tetap diterima.
+  partials: BOT_ROLE === 'all' || BOT_ROLE === 'reaction' ? [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User] : [],
+  intents: BOT_ROLE !== 'all' ? ROLE_INTENTS[BOT_ROLE] : [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers, // welcome/goodbye & invite log: aktifkan "Server Members Intent"
     GatewayIntentBits.GuildInvites, // invite log: lacak invite dan pemakaiannya
+    GatewayIntentBits.GuildVoiceStates, // voice stay
     GatewayIntentBits.GuildMessages, // XP dari chat
     GatewayIntentBits.MessageContent, // tidak lagi dipakai untuk level/lb (sekarang /level dan /leaderboard); boleh dihapus kalau tidak butuh baca isi pesan
   ],
 });
 
+
+// ============ reaction role ============
+// messageId -> Map(emojiKey -> { guildId, roleId, channelId }). emojiKey: id untuk emoji server, nama untuk emoji biasa.
+const REACTION_FILE = path.join(__dirname, 'reaction-roles.json');
+const reactionRoles = new Map();
+
+function loadReactionRoles() {
+  const raw = readJsonFile(REACTION_FILE);
+  if (!raw || typeof raw.messages !== 'object' || raw.messages === null) return;
+  for (const [messageId, emojis] of Object.entries(raw.messages)) {
+    if (!emojis || typeof emojis !== 'object') continue;
+    const m = new Map();
+    for (const [key, v] of Object.entries(emojis)) {
+      if (v && typeof v.guildId === 'string' && typeof v.roleId === 'string' && typeof v.channelId === 'string') {
+        m.set(key, { guildId: v.guildId, roleId: v.roleId, channelId: v.channelId });
+      }
+    }
+    if (m.size > 0) reactionRoles.set(messageId, m);
+  }
+}
+
+const reactionSaver = createSaver(REACTION_FILE, () => ({
+  messages: Object.fromEntries([...reactionRoles].map(([id, m]) => [id, Object.fromEntries(m)])),
+}));
+
+function emojiKeyOf(emoji) {
+  return emoji.id ?? emoji.name;
+}
+
+// Input: "👍" -> "👍", "<:nama:123>" -> "123". Dipakai untuk mencocokkan dengan emojiKeyOf.
+function emojiKeyFromInput(text) {
+  const custom = /^<a?:\w+:(\d+)>$/.exec(text);
+  return custom ? custom[1] : text;
+}
+
+async function applyReaction(reaction, user, add) {
+  if (user.bot) return;
+  if (reaction.partial) await reaction.fetch().catch(() => null);
+  const message = reaction.message?.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+  if (!message || !message.guild) return;
+  const entry = reactionRoles.get(message.id)?.get(emojiKeyOf(reaction.emoji));
+  if (!entry || entry.guildId !== message.guild.id) return;
+
+  const guild = message.guild;
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  const role = await guild.roles.fetch(entry.roleId).catch(() => null);
+  if (!member || !role) return;
+
+  const me = guild.members.me ?? await guild.members.fetch(client.user.id).catch(() => null);
+  if (!me || role.position >= me.roles.highest.position) {
+    console.warn(`reaction-role: role ${role.name} tidak bisa diatur bot (di atas role bot atau bot tidak punya izin)`);
+    return;
+  }
+  try {
+    if (add) await member.roles.add(role);
+    else await member.roles.remove(role);
+  } catch (err) {
+    console.error('reaction-role gagal:', err.message);
+  }
+}
+
+async function handleReactionRole(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa atur reaction role.', flags: MessageFlags.Ephemeral });
+  const guild = interaction.guild;
+  const sub = interaction.options.getSubcommand();
+  const fail = (text) => interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+
+  if (sub === 'add') {
+    const channel = interaction.options.getChannel('kanal', true);
+    const messageId = interaction.options.getString('message_id', true).trim();
+    const emojiText = interaction.options.getString('emoji', true).trim();
+    const role = interaction.options.getRole('role', true);
+    if (!/^\d{17,20}$/.test(messageId)) return fail('ID pesan tidak valid.');
+    if (!channel.isTextBased()) return fail('Kanal harus channel teks.');
+    if (role.managed || role.id === guild.id) return fail('Role ini tidak bisa diberikan lewat reaction.');
+    const me = guild.members.me ?? await guild.members.fetch(client.user.id).catch(() => null);
+    if (!me || !me.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position) {
+      return fail('Bot harus punya izin Manage Roles dan role-nya harus di atas role yang mau diberikan.');
+    }
+    const message = await channel.messages.fetch(messageId).catch(() => null);
+    if (!message) return fail('Pesan itu tidak ditemukan di kanal yang dipilih.');
+    try {
+      await message.react(emojiText);
+    } catch (err) {
+      return fail(`Emoji tidak bisa dipasang: ${err.message}`);
+    }
+    const emojis = reactionRoles.get(messageId) || new Map();
+    emojis.set(emojiKeyFromInput(emojiText), { guildId: guild.id, roleId: role.id, channelId: channel.id });
+    reactionRoles.set(messageId, emojis);
+    reactionSaver.save();
+    return interaction.reply({ content: `Reaction role aktif: ${emojiText} memberi <@&${role.id}> di pesan ini.`, allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'panel') {
+    const channel = interaction.options.getChannel('kanal', true);
+    const title = interaction.options.getString('judul', true).slice(0, 256);
+    const desc = (interaction.options.getString('deskripsi') ?? '').slice(0, 1000);
+    if (!channel.isTextBased()) return fail('Kanal harus channel teks.');
+
+    const pairs = [];
+    for (let i = 1; i <= 4; i++) {
+      const emojiText = interaction.options.getString(`emoji_${i}`)?.trim() ?? null;
+      const role = interaction.options.getRole(`role_${i}`);
+      if (!emojiText && !role) continue;
+      if (!emojiText || !role) return fail(`Pasangan ke-${i}: emoji dan role harus diisi berdua.`);
+      pairs.push({ emojiText, key: emojiKeyFromInput(emojiText), role });
+    }
+    if (pairs.length === 0) return fail('Isi minimal satu pasangan emoji dan role.');
+    if (new Set(pairs.map((p) => p.key)).size !== pairs.length) return fail('Emoji tidak boleh dipakai dua kali di satu panel.');
+
+    const me = guild.members.me ?? await guild.members.fetch(client.user.id).catch(() => null);
+    for (const p of pairs) {
+      if (p.role.managed || p.role.id === guild.id) return fail(`Role ${p.role.name} tidak bisa diberikan lewat reaction.`);
+      if (!me || !me.permissions.has(PermissionFlagsBits.ManageRoles) || p.role.position >= me.roles.highest.position) {
+        return fail('Bot harus punya izin Manage Roles dan role-nya harus di atas semua role di panel.');
+      }
+    }
+
+    const body = [desc, ...pairs.map((p) => `${p.emojiText} — <@&${p.role.id}>`)].filter(Boolean).join('\n\n');
+    const embed = new EmbedBuilder().setTitle(title).setDescription(body).setColor(COLOR_INFO);
+    const panel = await channel.send({ embeds: [embed], keepEmbed: true, allowedMentions: { parse: [] } }).catch(() => null);
+    if (!panel) return fail('Panel gagal dikirim ke kanal itu.');
+
+    const emojis = new Map();
+    const failedEmoji = [];
+    for (const p of pairs) {
+      try {
+        await panel.react(p.emojiText);
+        emojis.set(p.key, { guildId: guild.id, roleId: p.role.id, channelId: channel.id });
+      } catch {
+        failedEmoji.push(p.emojiText);
+      }
+    }
+    if (emojis.size > 0) {
+      reactionRoles.set(panel.id, emojis);
+      reactionSaver.save();
+    }
+    const note = failedEmoji.length ? ` Emoji yang gagal dipasang: ${failedEmoji.join(' ')}.` : '';
+    return interaction.reply({ content: `Panel dibuat di <#${channel.id}> dengan ID pesan ${panel.id}.${note}`, allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'remove') {
+    const messageId = interaction.options.getString('message_id', true).trim();
+    const emojiText = interaction.options.getString('emoji', true).trim();
+    const emojis = reactionRoles.get(messageId);
+    const key = emojiKeyFromInput(emojiText);
+    if (!emojis || !emojis.has(key)) return fail('Tidak ada reaction role dengan pesan dan emoji itu.');
+    emojis.delete(key);
+    if (emojis.size === 0) reactionRoles.delete(messageId);
+    reactionSaver.save();
+    return interaction.reply({ content: `Reaction role ${emojiText} dihapus. Emoji di pesan tidak ikut dihapus.`, allowedMentions: { parse: [] } });
+  }
+
+  // list
+  const lines = [];
+  for (const [messageId, emojis] of reactionRoles) {
+    for (const [key, entry] of emojis) {
+      if (entry.guildId !== guild.id) continue;
+      lines.push(`pesan ${messageId} • emoji ${key} → <@&${entry.roleId}> • <#${entry.channelId}>`);
+    }
+  }
+  if (lines.length === 0) return interaction.reply({ content: 'Belum ada reaction role di server ini.', flags: MessageFlags.Ephemeral });
+  return interaction.reply({ content: lines.slice(0, 20).join('\n'), allowedMentions: { parse: [] } });
+}
+
+loadReactionRoles();
+
+// ============ voice stay (bot tetap di voice channel) ============
+// Pakai paket @discordjs/voice. Dimuat lazy: kalau belum terpasang, bot tetap jalan dan voice dinonaktifkan.
+const VOICE_FILE = path.join(__dirname, 'voice-state.json');
+const VOICE_REJOIN_DELAY_MS = 10_000;
+const VOICE_WATCH_MS = 60_000;
+let voiceLib = null;
+try {
+  voiceLib = require('@discordjs/voice');
+} catch {
+  voiceLib = null;
+}
+const musicOff = /^(off|0|false|no)$/i.test(process.env.MUSIC_ENABLED ?? '');
+const music = require('./music').createMusic({
+  voiceLib: musicOff ? null : voiceLib,
+  dir: process.env.MUSIC_DIR || path.join(__dirname, 'music'),
+  volume: process.env.MUSIC_VOLUME,
+});
+const voiceStates = new Map(); // guildId -> { channelId }
+const voiceConnections = new Map(); // guildId -> connection
+const voiceRejoinTimers = new Map(); // guildId -> timer
+
+function loadVoiceState() {
+  const raw = readJsonFile(VOICE_FILE);
+  if (!raw || typeof raw.guilds !== 'object' || raw.guilds === null) return;
+  for (const [guildId, v] of Object.entries(raw.guilds)) {
+    if (v && typeof v.channelId === 'string') voiceStates.set(guildId, { channelId: v.channelId });
+  }
+}
+
+const voiceSaver = createSaver(VOICE_FILE, () => ({ guilds: Object.fromEntries(voiceStates) }));
+
+function destroyVoice(guildId) {
+  music.stop(guildId);
+  const conn = voiceConnections.get(guildId);
+  voiceConnections.delete(guildId);
+  if (conn) {
+    try {
+      conn.destroy();
+    } catch {
+      // koneksi sudah mati
+    }
+  }
+}
+
+// Berhenti stay total: lupakan channel, batalkan jadwal masuk lagi, putus koneksi, simpan ke file.
+// Dipakai untuk /voice leave dan saat bot di-kick dari voice.
+function forgetVoice(guildId) {
+  voiceStates.delete(guildId);
+  const timer = voiceRejoinTimers.get(guildId);
+  if (timer) clearTimeout(timer);
+  voiceRejoinTimers.delete(guildId);
+  destroyVoice(guildId);
+  voiceSaver.save();
+}
+
+function scheduleRejoin(guildId) {
+  if (voiceRejoinTimers.has(guildId) || !voiceStates.has(guildId)) return;
+  const timer = setTimeout(async () => {
+    voiceRejoinTimers.delete(guildId);
+    const st = voiceStates.get(guildId);
+    if (!st) return;
+    const guild = client.guilds.cache.get(guildId) ?? await client.guilds.fetch(guildId).catch(() => null);
+    if (guild) await joinStay(guild, st.channelId);
+  }, VOICE_REJOIN_DELAY_MS);
+  voiceRejoinTimers.set(guildId, timer);
+}
+
+// Masuk ke voice channel dan tetap di sana. Putus koneksi: masuk lagi otomatis. Di-kick dari voice atau /voice leave: berhenti.
+async function joinStay(guild, channelId) {
+  if (!voiceLib) return { ok: false, reason: 'paket @discordjs/voice belum terpasang di server bot' };
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isVoiceBased()) return { ok: false, reason: 'channel voice itu tidak ditemukan' };
+  const me = guild.members.me ?? await guild.members.fetch(client.user.id).catch(() => null);
+  if (!me || !me.permissionsIn(channel).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect])) {
+    return { ok: false, reason: 'bot butuh izin View Channel dan Connect di channel itu' };
+  }
+
+  destroyVoice(guild.id);
+  const conn = voiceLib.joinVoiceChannel({
+    channelId,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: true,
+    selfMute: !music.enabled,
+  });
+  voiceConnections.set(guild.id, conn);
+  music.start(guild.id, conn);
+  const { VoiceConnectionStatus, VoiceConnectionDisconnectReason, entersState } = voiceLib;
+
+  conn.on(VoiceConnectionStatus.Disconnected, async (_oldState, newState) => {
+    if (voiceConnections.get(guild.id) !== conn) return;
+    // Close code 4014 = bot dikeluarkan dari channel (kick, channel dihapus) atau dipindah.
+    const removedCode = newState.reason === VoiceConnectionDisconnectReason.WebSocketClose && newState.closeCode === 4014;
+    try {
+      await Promise.race([
+        entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+      return; // dipindah channel atau server voice berganti: library menyambung sendiri
+    } catch {
+      // tidak pulih sendiri
+    }
+    if (voiceConnections.get(guild.id) !== conn) return; // sudah dihentikan sengaja selama menunggu
+    const stillInVoice = Boolean((guild.members.me ?? await guild.members.fetch(client.user.id).catch(() => null))?.voice?.channelId);
+    if (removedCode && !stillInVoice) {
+      console.log(`voice: bot dikeluarkan dari voice di guild ${guild.id}, berhenti stay sampai /voice join lagi`);
+      forgetVoice(guild.id);
+      return;
+    }
+    // putus karena jaringan atau voice server: masuk lagi setelah jeda
+    destroyVoice(guild.id);
+    scheduleRejoin(guild.id);
+  });
+  conn.on(VoiceConnectionStatus.Destroyed, () => {
+    if (voiceConnections.get(guild.id) !== conn) return; // dihentikan sengaja (leave atau join ulang)
+    voiceConnections.delete(guild.id);
+    scheduleRejoin(guild.id);
+  });
+  return { ok: true, channelName: channel.name };
+}
+
+async function handleVoice(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
+  if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa atur voice bot.', flags: MessageFlags.Ephemeral });
+  const guild = interaction.guild;
+  const sub = interaction.options.getSubcommand();
+  const fail = (text) => interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+
+  if (sub === 'join') {
+    const channel = interaction.options.getChannel('kanal', true);
+    voiceStates.set(guild.id, { channelId: channel.id });
+    const res = await joinStay(guild, channel.id);
+    if (!res.ok) {
+      voiceStates.delete(guild.id);
+      return fail(`Bot tidak bisa masuk voice: ${res.reason}.`);
+    }
+    voiceSaver.save();
+    const musicNote = !music.enabled ? ''
+      : music.trackCount() > 0 ? ` Lagu diputar acak dari folder music (${music.trackCount()} file).`
+        : ' Folder music masih kosong, taruh file lagu di sana supaya bot mulai memutar.';
+    return interaction.reply({ content: `Bot sekarang stay di voice ${res.channelName}. Bot tetap di sana sampai di-kick dari voice atau kamu pakai /voice leave. Kalau cuma putus koneksi, bot masuk lagi otomatis.${musicNote}`, allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'leave') {
+    forgetVoice(guild.id);
+    return interaction.reply({ content: 'Bot keluar dari voice dan tidak akan masuk lagi sampai diatur ulang.', allowedMentions: { parse: [] } });
+  }
+
+  // status
+  const st = voiceStates.get(guild.id);
+  if (!st) return interaction.reply({ content: 'Bot tidak sedang stay di voice.', allowedMentions: { parse: [] } });
+  const conn = voiceConnections.get(guild.id);
+  const status = conn ? conn.state.status : 'belum terhubung';
+  const playing = music.nowPlaying(guild.id);
+  return interaction.reply({ content: `Bot stay di channel ${st.channelId}. Status: ${status}.${playing ? ` Sedang memutar: ${playing}.` : ''}`, allowedMentions: { parse: [] } });
+}
+
+loadVoiceState();
 
 const commands = [
   new SlashCommandBuilder()
@@ -1238,6 +1776,13 @@ const commands = [
       .addIntegerOption((o) => o.setName('level').setDescription('Level 1-1000').setRequired(true).setMinValue(1).setMaxValue(MAX_LEVEL)))
     .addSubcommand((sub) => sub.setName('list').setDescription('Lihat semua role hadiah level')),
   new SlashCommandBuilder()
+    .setName('afk-admin')
+    .setDescription('Hapus status AFK member lain (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false)
+    .addSubcommand((sub) => sub.setName('remove').setDescription('Hapus status AFK member tertentu')
+      .addUserOption((o) => o.setName('user').setDescription('Member yang AFK-nya mau dihapus').setRequired(true))),
+  new SlashCommandBuilder()
     .setName('lock')
     .setDescription('Kunci channel ini: member tidak bisa kirim pesan (admin)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -1252,8 +1797,7 @@ const commands = [
     .setDescription('Kelola status AFK')
     .addSubcommand((sub) => sub.setName('set').setDescription('Tandai dirimu AFK')
       .addStringOption((o) => o.setName('alasan').setDescription('Alasan AFK').setMaxLength(200)))
-    .addSubcommand((sub) => sub.setName('remove').setDescription('Hapus status AFK (member lain khusus admin)')
-      .addUserOption((o) => o.setName('user').setDescription('Member lain (kosong = kamu)')))
+    .addSubcommand((sub) => sub.setName('remove').setDescription('Hapus status AFK kamu sendiri'))
     .addSubcommand((sub) => sub.setName('list').setDescription('Lihat siapa yang sedang AFK di server ini'))
     .setDMPermission(false),
   new SlashCommandBuilder()
@@ -1262,11 +1806,85 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false)
     .addSubcommand((sub) => sub.setName('preview').setDescription('Lihat channel yang akan dikunci, tanpa mengubah apa pun')),
+  new SlashCommandBuilder()
+    .setName('xp-event')
+    .setDescription('Atur event XP ganda (admin)')
+    .setDefaultMemberPermissions(0)
+    .setDMPermission(false)
+    .addSubcommand((sub) => sub.setName('start').setDescription('Mulai event XP ganda')
+      .addIntegerOption((o) => o.setName('multiplier').setDescription('Pengali XP, misal 2 untuk x2').setRequired(true).setMinValue(2).setMaxValue(XP_EVENT_MAX_MULTIPLIER))
+      .addIntegerOption((o) => o.setName('jam').setDescription('Lama event dalam jam').setRequired(true).setMinValue(1).setMaxValue(XP_EVENT_MAX_HOURS)))
+    .addSubcommand((sub) => sub.setName('stop').setDescription('Hentikan event XP sekarang'))
+    .addSubcommand((sub) => sub.setName('status').setDescription('Lihat event XP yang sedang aktif')),
+  new SlashCommandBuilder()
+    .setName('xp-rate')
+    .setDescription('Atur besar XP per pesan dan cooldown (admin)')
+    .setDefaultMemberPermissions(0)
+    .setDMPermission(false)
+    .addSubcommand((sub) => sub.setName('set').setDescription('Atur XP minimum, maksimum, dan cooldown')
+      .addIntegerOption((o) => o.setName('min').setDescription('XP minimum per pesan').setRequired(true).setMinValue(1).setMaxValue(XP_RATE_MAX))
+      .addIntegerOption((o) => o.setName('max').setDescription('XP maksimum per pesan').setRequired(true).setMinValue(1).setMaxValue(XP_RATE_MAX))
+      .addIntegerOption((o) => o.setName('cooldown').setDescription('Jeda antar XP dalam detik (kosong = tidak diubah)').setMinValue(1).setMaxValue(XP_COOLDOWN_MAX_SECONDS)))
+    .addSubcommand((sub) => sub.setName('reset').setDescription('Kembalikan XP dan cooldown ke bawaan'))
+    .addSubcommand((sub) => sub.setName('status').setDescription('Lihat XP per pesan dan cooldown sekarang')),
+  new SlashCommandBuilder()
+    .setName('reaction-role')
+    .setDescription('Atur reaction role (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false)
+    .addSubcommand((sub) => sub.setName('add').setDescription('Pasang reaction role di sebuah pesan')
+      .addChannelOption((o) => o.setName('kanal').setDescription('Kanal pesannya').setRequired(true).addChannelTypes(ChannelType.GuildText))
+      .addStringOption((o) => o.setName('message_id').setDescription('ID pesan').setRequired(true))
+      .addStringOption((o) => o.setName('emoji').setDescription('Emoji, misal 👍 atau emoji server').setRequired(true))
+      .addRoleOption((o) => o.setName('role').setDescription('Role yang diberikan').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('remove').setDescription('Hapus reaction role dari sebuah pesan')
+      .addStringOption((o) => o.setName('message_id').setDescription('ID pesan').setRequired(true))
+      .addStringOption((o) => o.setName('emoji').setDescription('Emoji yang dihapus').setRequired(true)))
+    .addSubcommand((sub) => {
+      sub.setName('panel').setDescription('Posting panel embed dengan beberapa reaction role')
+        .addChannelOption((o) => o.setName('kanal').setDescription('Kanal tujuan panel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+        .addStringOption((o) => o.setName('judul').setDescription('Judul panel').setRequired(true))
+        .addStringOption((o) => o.setName('emoji_1').setDescription('Emoji pertama').setRequired(true))
+        .addRoleOption((o) => o.setName('role_1').setDescription('Role untuk emoji pertama').setRequired(true));
+      sub.addStringOption((o) => o.setName('deskripsi').setDescription('Teks di atas daftar role (opsional)').setMaxLength(1000));
+      for (let i = 2; i <= 4; i++) {
+        sub.addStringOption((o) => o.setName(`emoji_${i}`).setDescription(`Emoji ke-${i} (opsional)`));
+        sub.addRoleOption((o) => o.setName(`role_${i}`).setDescription(`Role untuk emoji ke-${i} (opsional)`));
+      }
+      return sub;
+    })
+    .addSubcommand((sub) => sub.setName('list').setDescription('Lihat reaction role yang aktif')),
+  new SlashCommandBuilder()
+    .setName('voice')
+    .setDescription('Bot stay di voice channel (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDMPermission(false)
+    .addSubcommand((sub) => sub.setName('join').setDescription('Bot masuk dan stay di voice channel ini')
+      .addChannelOption((o) => o.setName('kanal').setDescription('Voice channel').setRequired(true).addChannelTypes(ChannelType.GuildVoice)))
+    .addSubcommand((sub) => sub.setName('leave').setDescription('Bot keluar dari voice dan berhenti stay'))
+    .addSubcommand((sub) => sub.setName('status').setDescription('Lihat status stay bot')),
 ];
 
+if (runs('reaction')) client.on(Events.MessageReactionAdd, (reaction, user) => applyReaction(reaction, user, true).catch((err) => console.error('reaction-role:', err)));
+if (runs('reaction')) client.on(Events.MessageReactionRemove, (reaction, user) => applyReaction(reaction, user, false).catch((err) => console.error('reaction-role:', err)));
+
 client.once(Events.ClientReady, async (c) => {
-  await c.application.commands.set(commands.map((cmd) => cmd.toJSON()));
-  for (const guild of c.guilds.cache.values()) await initGuildInvites(guild);
+  await c.application.commands.set(commands.filter((cmd) => runs(COMMAND_FEATURE[cmd.name])).map((cmd) => cmd.toJSON()));
+  if (runs('welcome')) for (const guild of c.guilds.cache.values()) await initGuildInvites(guild);
+  if (runs('welcome') && voiceLib) {
+    for (const [guildId, st] of voiceStates) {
+      const guild = c.guilds.cache.get(guildId);
+      if (!guild) continue;
+      const res = await joinStay(guild, st.channelId);
+      if (!res.ok) console.warn(`voice: gagal masuk lagi ke ${st.channelId}: ${res.reason}`);
+    }
+    // pengawas: kalau ada yang belum terhubung dan belum dijadwalkan, jadwalkan masuk lagi
+    setInterval(() => {
+      for (const guildId of voiceStates.keys()) {
+        if (!voiceConnections.has(guildId)) scheduleRejoin(guildId);
+      }
+    }, VOICE_WATCH_MS).unref();
+  }
   console.log(`Login sebagai ${c.user.tag}`);
   if (!cfg.welcomeChannelId) console.warn('welcome: WELCOME_CHANNEL_ID belum di-set, fitur welcome nonaktif');
   if (!cfg.goodbyeChannelId) console.warn('goodbye: GOODBYE_CHANNEL_ID belum di-set, fitur goodbye nonaktif');
@@ -1276,11 +1894,11 @@ client.once(Events.ClientReady, async (c) => {
   if (!cfg.levelCommandChannelId) console.warn('level: LEVEL_COMMAND_CHANNEL_ID belum di-set, /level dan /leaderboard bisa dipakai di channel mana saja');
 });
 
-client.on(Events.GuildCreate, (guild) => {
+if (runs('welcome')) client.on(Events.GuildCreate, (guild) => {
   initGuildInvites(guild).catch((err) => console.error('GuildCreate invite error:', err));
 });
 
-client.on(Events.InviteCreate, (invite) => {
+if (runs('welcome')) client.on(Events.InviteCreate, (invite) => {
   const guildId = invite.guild?.id;
   if (!guildId) return;
   const map = inviteCache.get(guildId) || new Map();
@@ -1293,23 +1911,23 @@ client.on(Events.InviteCreate, (invite) => {
   inviteCache.set(guildId, map);
 });
 
-client.on(Events.InviteDelete, (invite) => {
+if (runs('welcome')) client.on(Events.InviteDelete, (invite) => {
   const guildId = invite.guild?.id;
   if (!guildId) return;
   inviteCache.get(guildId)?.delete(invite.code);
 });
 
-client.on(Events.GuildMemberAdd, (member) => {
+if (runs('welcome')) client.on(Events.GuildMemberAdd, (member) => {
   sendWelcome(member).catch((err) => console.error('sendWelcome error:', err));
   withGuildLock(member.guild.id, () => handleInviteJoin(member));
 });
 
-client.on(Events.GuildMemberRemove, (member) => {
+if (runs('welcome')) client.on(Events.GuildMemberRemove, (member) => {
   sendGoodbye(member).catch((err) => console.error('sendGoodbye error:', err));
   withGuildLock(member.guild.id, () => handleInviteLeave(member));
 });
 
-client.on(Events.MessageCreate, async (message) => {
+if (runs('level')) client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot || !message.guild) return;
     await afkHandle(message);
@@ -1323,10 +1941,22 @@ client.on(Events.MessageCreate, async (message) => {
       if (!target) {
         console.warn(`level up: channel ${cfg.levelUpChannelId} tidak ditemukan atau bukan channel teks`);
       } else {
-        await target.send({
-          embeds: [levelUpEmbed(message.author, gain.level, granted)],
-          allowedMentions: { parse: [] },
-        }).catch((err) => console.error('gagal kirim level up:', err.message));
+        // Notifikasi naik level pakai kartu profil seperti /level (avatar, level, XP). Kalau render gagal, pakai embed lama.
+        const roleText = granted.length ? ` Role baru: ${granted.map((r) => `<@&${r.id}>`).join(' ')}.` : '';
+        let card = null;
+        try {
+          card = await levelCardFile(message.author, message.guild.id);
+        } catch (err) {
+          console.error('level up card gagal, pakai embed:', err.message);
+        }
+        const payload = card
+          ? {
+              content: `Selamat ${message.author}, kamu naik ke Level ${gain.level}!${roleText}`,
+              files: [card],
+              allowedMentions: { users: [message.author.id], roles: granted.map((r) => r.id) },
+            }
+          : { embeds: [levelUpEmbed(message.author, gain.level, granted)], allowedMentions: { parse: [] } };
+        await target.send(payload).catch((err) => console.error('gagal kirim level up:', err.message));
       }
     }
   } catch (err) {
@@ -1337,6 +1967,7 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+  if (!runs(COMMAND_FEATURE[interaction.commandName])) return;
   try {
     if (interaction.commandName === 'obfu-file') {
       await handleObfuFile(interaction);
@@ -1352,10 +1983,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleLock(interaction);
     } else if (interaction.commandName === 'unlock') {
       await handleUnlock(interaction);
-    } else if (interaction.commandName === 'afk') {
+    } else if (interaction.commandName === 'afk' || interaction.commandName === 'afk-admin') {
       await handleAfk(interaction);
     } else if (interaction.commandName === 'xp-only') {
       await handleXpOnly(interaction);
+    } else if (interaction.commandName === 'xp-event') {
+      await handleXpEvent(interaction);
+    } else if (interaction.commandName === 'xp-rate') {
+      await handleXpRate(interaction);
+    } else if (interaction.commandName === 'reaction-role') {
+      await handleReactionRole(interaction);
+    } else if (interaction.commandName === 'voice') {
+      await handleVoice(interaction);
     }
   } catch (err) {
     console.error('interaction error:', err);
@@ -1366,10 +2005,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 function saveAll() {
-  xpSaver.save();
-  inviteSaver.save();
-  levelRoleSaver.save();
-  afkSaver.save();
+  if (runs('level')) {
+    xpSaver.save();
+    levelRoleSaver.save();
+    afkSaver.save();
+  }
+  if (runs('welcome')) {
+    inviteSaver.save();
+    voiceSaver.save();
+  }
+  if (runs('reaction')) reactionSaver.save();
 }
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -1386,6 +2031,8 @@ module.exports = {
   handleLevel, handleLeaderboard, awardXp, users, inviteCache, inviteCounts, joinedBy,
   detectInviter, cacheInvites, handleInviteJoin, handleInviteLeave, saveAll,
   loadConfig, fetchTextSafe,
+  applyReaction, handleReactionRole, reactionRoles, emojiKeyFromInput,
+  handleVoice, voiceStates, voiceConnections,
 };
 
 if (require.main === module) {

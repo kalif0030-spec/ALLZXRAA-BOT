@@ -9,17 +9,50 @@ const V = require('./vm_level2');
 const MAX_REG = 250;     // register 254 dipakai sebagai "nil" di RET tanpa nilai
 const NIL_REG = 254;
 
+// String literal Lua sederhana: "..." atau '...', escape \n \t \\ \" \' dan \ddd.
+function parseStringLiteral(src, start) {
+  const q = src[start];
+  let j = start + 1;
+  let value = '';
+  while (j < src.length) {
+    const c = src[j];
+    if (c === q) return { value, next: j + 1 };
+    if (c === '\n') throw new SyntaxError(`string belum ditutup (posisi ${start})`);
+    if (c === '\\') {
+      const n = src[j + 1];
+      if (n === undefined) break;
+      const map = { n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', "'": "'" };
+      if (/\d/.test(n)) {
+        const m = /^\d{1,3}/.exec(src.slice(j + 1));
+        value += String.fromCharCode(Number(m[0]) & 0xff);
+        j += 1 + m[0].length;
+        continue;
+      }
+      if (!(n in map)) throw new SyntaxError(`escape \\${n} belum didukung di vm2`);
+      value += map[n];
+      j += 2;
+      continue;
+    }
+    value += c;
+    j += 1;
+  }
+  throw new SyntaxError(`string belum ditutup (posisi ${start})`);
+}
+
 function tokenize(src) {
   const toks = [];
-  const re = /\s+|(\d+)|([A-Za-z_]\w*)|(==|<|\+|-|\*|\(|\)|=|,|\[|\]|\{|\}|#)/y;
+  const re = /\s+|(\d+)|([A-Za-z_]\w*)|(==|~=|<|\+|-|\*|\(|\)|=|,|\[|\]|\{|\}|#|\.)/y;
   let i = 0;
   while (i < src.length) {
     re.lastIndex = i;
     const m = re.exec(src);
     if (!m) {
-      if (src[i] === '"' || src[i] === "'") throw new SyntaxError(`string belum didukung di vm2 (posisi ${i})`);
-      if (src[i] === '.') throw new SyntaxError(`akses titik (t.x) belum didukung di vm2 (posisi ${i})`);
-      if (src[i] === '~') throw new SyntaxError(`operator ~= belum didukung di vm2 (posisi ${i})`);
+      if (src[i] === '"' || src[i] === "'") {
+        const str = parseStringLiteral(src, i);
+        toks.push({ t: 'str', v: str.value });
+        i = str.next;
+        continue;
+      }
       throw new SyntaxError(`karakter tidak dikenal di ${i}: ${src[i]}`);
     }
     i = re.lastIndex;
@@ -54,6 +87,7 @@ function parse(src) {
     let l = add();
     if (peek().t === '<') { p++; l = { k: 'bin', op: 'LT', l, r: add() }; }
     else if (peek().t === '==') { p++; l = { k: 'bin', op: 'EQ', l, r: add() }; }
+    else if (peek().t === '~=') { p++; l = { k: 'not', e: { k: 'bin', op: 'EQ', l, r: add() } }; }
     return l;
   }
   function add() {
@@ -75,17 +109,25 @@ function parse(src) {
     return atom();
   }
   function postfix(node) {
-    while (peek().t === '[') {
-      p++;
-      const key = expr();
-      eat(']');
-      node = { k: 'index', t: node, key };
+    for (;;) {
+      if (peek().t === '[') {
+        p++;
+        const key = expr();
+        eat(']');
+        node = { k: 'index', t: node, key };
+      } else if (peek().t === '.') {
+        p++;
+        const name = eat('name').v;
+        node = { k: 'index', t: node, key: { k: 'str', v: name } };
+      } else {
+        return node;
+      }
     }
-    return node;
   }
   function atom() {
     const t = peek();
     if (t.t === 'num') { p++; return { k: 'num', v: t.v }; }
+    if (t.t === 'str') { p++; return { k: 'str', v: t.v }; }
     if (t.t === 'name') {
       p++;
       if (peek().t === '(') {
@@ -127,6 +169,16 @@ function parse(src) {
     if (t.t === 'local') { p++; const name = eat('name').v; eat('='); return { k: 'local', name, e: expr() }; }
     if (t.t === 'name' && toks[p + 1].t === '=') { p++; eat('='); return { k: 'assign', name: t.v, e: expr() }; }
     if (t.t === 'name' && toks[p + 1].t === '(') { return { k: 'expr', e: expr() }; }
+    if (t.t === 'name' && toks[p + 1].t === '.') {
+      p++;
+      const keys = [];
+      while (peek().t === '.') { p++; keys.push({ k: 'str', v: eat('name').v }); }
+      eat('=');
+      const last = keys.pop();
+      let obj = { k: 'name', v: t.v };
+      for (const key of keys) obj = { k: 'index', t: obj, key };
+      return { k: 'setindex', t: obj, key: last, e: expr() };
+    }
     if (t.t === 'name' && toks[p + 1].t === '[') {
       p++;
       const keys = [];
@@ -208,7 +260,7 @@ function compile(src) {
   const emit = (op, a = 0, b = 0, c = 0) => { code.push({ op, a, b, c }); return code.length - 1; };
 
   function expr(e) {
-    if (e.k === 'num') { const r = alloc(); emit('LOADK', r, constIdx(e.v)); return r; }
+    if (e.k === 'num' || e.k === 'str') { const r = alloc(); emit('LOADK', r, constIdx(e.v)); return r; }
     if (e.k === 'name') {
       if (!scope.has(e.v)) throw new ReferenceError(`nama tidak dikenal: ${e.v}`);
       return scope.get(e.v);

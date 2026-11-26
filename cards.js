@@ -120,46 +120,158 @@ function drawAvatar(ctx, img, cx, cy, r, ringWidth, ringColor, label) {
   ctx.restore();
 }
 
-function drawGlowLine(ctx, x0, y0, x1, y1) {
-  ctx.save();
-  ctx.strokeStyle = '#4d94ff';
-  ctx.lineWidth = 3;
-  ctx.shadowColor = '#2f7bff';
-  ctx.shadowBlur = 14;
-  ctx.beginPath();
-  ctx.moveTo(x0, y0);
-  ctx.lineTo(x1, y1);
-  ctx.stroke();
-  ctx.restore();
+// Latar galaksi: gradasi ruang, awan nebula, lengan spiral, dan bintang kecil.
+// Acaknya pakai seed tetap, jadi hasilnya sama setiap render.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-// Latar biru gelap bergaya "tech": gradasi, cahaya tengah, dan garis neon di tepi kiri dan kanan.
-function drawTechBackground(ctx, w, h) {
-  const base = ctx.createLinearGradient(0, 0, 0, h);
-  base.addColorStop(0, '#020817');
-  base.addColorStop(0.5, '#08246f');
-  base.addColorStop(1, '#020817');
+function drawGalaxyBackground(ctx, w, h) {
+  const rand = mulberry32(0x9e3779b9);
+
+  const base = ctx.createLinearGradient(0, 0, w, h);
+  base.addColorStop(0, '#05030f');
+  base.addColorStop(0.5, '#0b0630');
+  base.addColorStop(1, '#02040c');
   ctx.fillStyle = base;
   ctx.fillRect(0, 0, w, h);
 
-  const glow = ctx.createRadialGradient(w / 2, h * 0.45, 10, w / 2, h * 0.45, w * 0.55);
-  glow.addColorStop(0, 'rgba(40, 110, 255, 0.35)');
-  glow.addColorStop(1, 'rgba(40, 110, 255, 0)');
-  ctx.fillStyle = glow;
-  ctx.fillRect(0, 0, w, h);
+  const nebulae = [
+    [w * 0.18, h * 0.3, w * 0.35, 'rgba(120, 60, 255, 0.35)'],
+    [w * 0.85, h * 0.75, w * 0.4, 'rgba(255, 70, 160, 0.25)'],
+    [w * 0.5, h * 0.5, w * 0.55, 'rgba(40, 140, 255, 0.16)'],
+  ];
+  for (const [x, y, r, color] of nebulae) {
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, color);
+    g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+  }
 
-  const mid = h * 0.52;
-  drawGlowLine(ctx, 0, mid, w * 0.2, mid);
-  drawGlowLine(ctx, w * 0.8, mid, w, mid);
-  drawGlowLine(ctx, 0, h * 0.18, w * 0.08, h * 0.18);
-  drawGlowLine(ctx, w * 0.92, h * 0.82, w, h * 0.82);
+  for (let i = 0; i < 350; i++) {
+    const x = rand() * w;
+    const y = rand() * h;
+    const s = rand() * 1.4 + 0.3;
+    ctx.fillStyle = `rgba(255, 255, 255, ${(0.3 + rand() * 0.7).toFixed(2)})`;
+    ctx.beginPath();
+    ctx.arc(x, y, s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // dua lengan spiral, dibuat tipis (squish) supaya terlihat seperti galaksi miring
+  const gx = w * 0.78;
+  const gy = h * 0.5;
+  const armColors = ['190, 170, 255', '255, 190, 230'];
+  for (let arm = 0; arm < 2; arm++) {
+    for (let i = 0; i < 700; i++) {
+      const t = rand();
+      const r = 20 + t * w * 0.3;
+      const ang = t * 4.2 + arm * Math.PI + (rand() - 0.5) * 0.5;
+      const jitter = (rand() - 0.5) * (14 + t * 30);
+      const x = gx + Math.cos(ang) * r + jitter;
+      const y = gy + Math.sin(ang) * r * 0.45 + jitter * 0.5;
+      const alpha = (0.2 + rand() * 0.6 * (1 - t * 0.6)).toFixed(2);
+      ctx.fillStyle = `rgba(${armColors[arm]}, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(x, y, rand() * 1.6 + 0.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  const core = ctx.createRadialGradient(gx, gy, 0, gx, gy, w * 0.08);
+  core.addColorStop(0, 'rgba(255, 240, 220, 0.9)');
+  core.addColorStop(0.4, 'rgba(255, 200, 150, 0.35)');
+  core.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  ctx.fillStyle = core;
+  ctx.fillRect(0, 0, w, h);
+}
+
+// Kartu hasil obfuscate: avatar pemohon, status, detail, dan footer "Request by <nama>" dengan centang.
+// Centang digambar dengan path, bukan emoji, karena font kartu tidak punya glyph emoji.
+async function renderObfuCard({ avatarUrl, requester, ok, title, lines }) {
+  const W = 934;
+  const H = 300;
+  const canvas = napi.createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  const accent = ok ? '#57f287' : '#ed4245';
 
   ctx.save();
-  ctx.strokeStyle = 'rgba(77, 148, 255, 0.45)';
+  roundRectPath(ctx, 0, 0, W, H, 28);
+  ctx.clip();
+  drawGalaxyBackground(ctx, W, H);
+  ctx.restore();
+  ctx.save();
+  ctx.strokeStyle = accent;
+  ctx.globalAlpha = 0.6;
   ctx.lineWidth = 2;
-  roundRectPath(ctx, 6, 6, w - 12, h - 12, 26);
+  roundRectPath(ctx, 3, 3, W - 6, H - 6, 26);
   ctx.stroke();
   ctx.restore();
+
+  const img = await loadAvatar(avatarUrl);
+  drawAvatar(ctx, img, 150, H / 2, 85, 6, accent, requester);
+
+  const left = 280;
+  const maxW = W - left - 40;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  const label = ok ? 'BERHASIL' : 'GAGAL';
+  ctx.font = font('bold', 20);
+  const pillW = ctx.measureText(label).width + 30;
+  ctx.save();
+  roundRectPath(ctx, left, 50, pillW, 34, 17);
+  ctx.fillStyle = accent;
+  ctx.globalAlpha = 0.22;
+  ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = accent;
+  ctx.fillText(label, left + 15, 74);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = font('bold', 40);
+  ctx.fillText(fitText(ctx, title || 'Obfuscate', maxW), left, 128);
+
+  ctx.fillStyle = '#c9d6ff';
+  ctx.font = font('normal', 24);
+  const sub = wrapLines(ctx, (lines || []).join(' • '), maxW, 3);
+  sub.forEach((line, i) => ctx.fillText(line, left, 170 + i * 32));
+
+  // footer: centang + Request by <nama>
+  const fy = H - 52;
+  const cx = left + 14;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, fy, 14, 0, Math.PI * 2);
+  ctx.fillStyle = '#3d8bff';
+  ctx.fill();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 3.5;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, fy + 1);
+  ctx.lineTo(cx - 1.5, fy + 7);
+  ctx.lineTo(cx + 7.5, fy - 5);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = font('bold', 26);
+  ctx.fillText(fitText(ctx, `Request by ${requester || 'member'}`, maxW - 40), left + 40, fy + 9);
+
+  ctx.fillStyle = '#8fa6d9';
+  ctx.font = font('bold', 16);
+  ctx.fillText('ALLZXRAA COMMUNITY', left, H - 18);
+  return canvas.encode('png');
 }
 
 function drawBar(ctx, x, y, w, h, ratio, fillFrom, fillTo) {
@@ -186,7 +298,7 @@ async function renderEventCard({ avatarUrl, name, title, subtitle }) {
   const H = 450;
   const canvas = napi.createCanvas(W, H);
   const ctx = canvas.getContext('2d');
-  drawTechBackground(ctx, W, H);
+  drawGalaxyBackground(ctx, W, H);
 
   const img = await loadAvatar(avatarUrl);
   drawAvatar(ctx, img, W / 2, H * 0.37, 100, 7, '#ffffff', name);
@@ -226,12 +338,11 @@ async function renderLevelCard(data) {
   const canvas = napi.createCanvas(W, H);
   const ctx = canvas.getContext('2d');
 
-  const bg = ctx.createLinearGradient(0, 0, W, H);
-  bg.addColorStop(0, '#0b1230');
-  bg.addColorStop(1, '#0f2a6b');
+  ctx.save();
   roundRectPath(ctx, 0, 0, W, H, 28);
-  ctx.fillStyle = bg;
-  ctx.fill();
+  ctx.clip();
+  drawGalaxyBackground(ctx, W, H);
+  ctx.restore();
   ctx.save();
   ctx.strokeStyle = 'rgba(77, 148, 255, 0.5)';
   ctx.lineWidth = 2;
@@ -283,7 +394,7 @@ async function renderLeaderboardCard({ guildName, rows }) {
   const H = HEADER + count * ROW_STEP + 20;
   const canvas = napi.createCanvas(W, H);
   const ctx = canvas.getContext('2d');
-  drawTechBackground(ctx, W, H);
+  drawGalaxyBackground(ctx, W, H);
 
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
@@ -339,23 +450,131 @@ async function renderLeaderboardCard({ guildName, rows }) {
 }
 
 // ============ kartu info (dipakai untuk balasan bot yang belum punya gambar) ============
-// title: teks utama. subtitle: teks kedua (boleh kosong). Gaya sama dengan kartu welcome.
-async function renderInfoCard({ title, subtitle }) {
+// title: judul utama (maks 2 baris). subtitle: penjelas (maks 3 baris). accent: warna aksen hex.
+const DEFAULT_ACCENT = '#4d94ff';
+
+// Pecah teks ke beberapa baris sesuai lebar. Baris terakhir dipotong "…" bila masih kelebihan.
+function wrapLines(ctx, text, maxWidth, maxLines) {
+  const words = String(text ?? '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    const trial = cur ? `${cur} ${w}` : w;
+    if (ctx.measureText(trial).width <= maxWidth) {
+      cur = trial;
+    } else {
+      if (cur) lines.push(cur);
+      cur = w;
+    }
+  }
+  if (cur) lines.push(cur);
+  if (lines.length > maxLines) {
+    const kept = lines.slice(0, maxLines);
+    kept[maxLines - 1] = fitText(ctx, `${kept[maxLines - 1]} ${lines.slice(maxLines).join(' ')}`, maxWidth);
+    return kept;
+  }
+  return lines.map((l) => fitText(ctx, l, maxWidth));
+}
+
+// Label status dari warna aksen: merah = GAGAL, kuning/oranye = PERINGATAN, hijau = BERHASIL, lainnya = INFO.
+function statusLabel(hex) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  if (r > 180 && g < 110 && b < 110) return 'GAGAL';
+  if (r > 180 && g > 140 && b < 120) return 'PERINGATAN';
+  if (g > r + 40 && g > b) return 'BERHASIL';
+  return 'INFO';
+}
+
+function drawAccentGlow(ctx, x, y, r, color) {
+  ctx.save();
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, color);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.globalAlpha = 0.3;
+  ctx.fillStyle = g;
+  ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  ctx.restore();
+}
+
+async function renderInfoCard({ title, subtitle, accent }) {
   const W = 1000;
-  const H = 380;
+  const H = 400;
+  const color = /^#[0-9a-fA-F]{6}$/.test(accent || '') ? accent : DEFAULT_ACCENT;
   const canvas = napi.createCanvas(W, H);
   const ctx = canvas.getContext('2d');
-  drawTechBackground(ctx, W, H);
-  ctx.textAlign = 'center';
+  drawGalaxyBackground(ctx, W, H);
+  drawAccentGlow(ctx, W - 80, 60, 320, color);
+  drawAccentGlow(ctx, 60, H - 40, 220, color);
+
+  // panel kaca dengan border aksen dan cahaya
+  const PX = 30, PY = 30, PW = W - 60, PH = H - 60;
+  ctx.save();
+  roundRectPath(ctx, PX, PY, PW, PH, 24);
+  ctx.fillStyle = 'rgba(8, 18, 45, 0.55)';
+  ctx.fill();
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 22;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  ctx.restore();
+
+  // bilah aksen tebal di kiri panel
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 16;
+  roundRectPath(ctx, PX + 22, PY + 34, 6, PH - 68, 3);
+  ctx.fill();
+  ctx.restore();
+
+  const left = PX + 60;
+  const maxW = PW - 120;
+  ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
+
+  // label status (pill) di atas
+  const label = statusLabel(color);
+  ctx.font = font('bold', 18);
+  const pillW = ctx.measureText(label).width + 30;
+  ctx.save();
+  roundRectPath(ctx, left, PY + 36, pillW, 34, 17);
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.22;
+  ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = color;
+  ctx.fillText(label, left + 15, PY + 59);
+
+  // judul
   ctx.fillStyle = '#ffffff';
-  ctx.font = font('bold', 40);
-  ctx.fillText(fitText(ctx, title || 'ALLZXRAA', W * 0.9), W / 2, H * 0.52);
+  ctx.font = font('bold', 50);
+  const titleLines = wrapLines(ctx, title || 'ALLZXRAA', maxW, 2);
+  let y = PY + 135;
+  titleLines.forEach((line, i) => ctx.fillText(line, left, y + i * 60));
+  y += (titleLines.length - 1) * 60;
+
+  // garis pemisah gradasi
+  const sep = ctx.createLinearGradient(left, 0, left + maxW, 0);
+  sep.addColorStop(0, color);
+  sep.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = sep;
+  ctx.fillRect(left, y + 28, maxW * 0.7, 2);
+
+  // penjelas
   if (subtitle) {
-    ctx.fillStyle = '#b8c7ff';
-    ctx.font = font('normal', 26);
-    ctx.fillText(fitText(ctx, subtitle, W * 0.9), W / 2, H * 0.66);
+    ctx.fillStyle = '#c9d6ff';
+    ctx.font = font('normal', 28);
+    const subLines = wrapLines(ctx, subtitle, maxW, 3);
+    subLines.forEach((line, i) => ctx.fillText(line, left, y + 72 + i * 38));
   }
+
+  // footer
+  ctx.fillStyle = color;
+  ctx.font = font('bold', 16);
+  ctx.fillText('ALLZXRAA COMMUNITY', left, PY + PH - 26);
   return canvas.encode('png');
 }
 
@@ -366,6 +585,7 @@ module.exports = {
   renderLevelCard,
   renderLeaderboardCard,
   renderInfoCard,
+  renderObfuCard,
   formatNumber,
   clamp01,
 };
