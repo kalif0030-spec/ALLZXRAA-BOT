@@ -17,6 +17,9 @@ local _chunk, _err = _load(_src, "=ALLZXRAA")
 if not _chunk then error(_err, 0) end
 return _chunk(...)`;
 
+// Toleran: indentasi spasi/tab, hex huruf besar/kecil, koma penutup opsional, spasi di ujung baris.
+const CHUNK_LINE = /^[ \t]*"([0-9a-fA-F]*)"[ \t]*,?[ \t]*$/;
+
 function deobfuscateLegacy(sourceBuf, { banner, maxSourceBytes }) {
   if (!Buffer.isBuffer(sourceBuf)) throw new TypeError('sourceBuf harus Buffer');
   if (typeof banner !== 'string' || !banner) throw new TypeError('banner tidak valid');
@@ -24,20 +27,25 @@ function deobfuscateLegacy(sourceBuf, { banner, maxSourceBytes }) {
     throw new TypeError('maxSourceBytes tidak valid');
   }
 
-  const text = sourceBuf.toString('utf8').replace(/\r\n/g, '\n');
+  let text = sourceBuf.toString('utf8');
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  text = text.replace(/\r\n?/g, '\n').replace(/^\s+/, '');
   const wrapper = /^loadstring\(\[=\[\n([\s\S]*?)\n\]=\]\)\(\)\s*$/.exec(text);
-  if (!wrapper) throw new Error('format ALLZXRAA lama tidak dikenali');
+  if (!wrapper) throw new Error(`format ALLZXRAA lama tidak dikenali (akhir file: ${JSON.stringify(text.slice(-30))})`);
 
   const inner = wrapper[1];
   const head = `${banner.replace(/\r\n/g, '\n')}\nlocal _CHUNKS = {\n`;
-  if (!inner.startsWith(head)) throw new Error('banner atau header ALLZXRAA tidak valid');
+  if (!inner.startsWith(head)) {
+    throw new Error(`banner atau header ALLZXRAA tidak valid (awal: ${JSON.stringify(inner.slice(0, 40))})`);
+  }
 
   const chunksEnd = inner.indexOf('\n}\nlocal _K = {', head.length);
   if (chunksEnd < 0) throw new Error('daftar chunk ALLZXRAA tidak lengkap');
   const chunksText = inner.slice(head.length, chunksEnd);
   const chunkLines = chunksText.split('\n');
-  if (chunkLines.length === 0 || chunkLines.some((line) => !/^    "[0-9a-f]*",$/.test(line))) {
-    throw new Error('chunk ALLZXRAA tidak valid');
+  const badIndex = chunkLines.findIndex((line) => !CHUNK_LINE.test(line));
+  if (chunkLines.length === 0 || badIndex >= 0) {
+    throw new Error(`chunk ALLZXRAA tidak valid (baris chunk ke-${badIndex + 1}: ${JSON.stringify((chunkLines[badIndex] ?? '').slice(0, 50))})`);
   }
 
   const metadata = /^\}\nlocal _K = \{([^\n]*)\}\nlocal _N = #_K\nlocal _EXPECT = ([0-9]+)\n\n([\s\S]*)$/.exec(inner.slice(chunksEnd + 1));
@@ -57,7 +65,7 @@ function deobfuscateLegacy(sourceBuf, { banner, maxSourceBytes }) {
     throw new Error('ukuran payload ALLZXRAA tidak valid atau melebihi batas');
   }
 
-  const chunks = chunkLines.map((line) => /^    "([0-9a-f]*)",$/.exec(line)[1]);
+  const chunks = chunkLines.map((line) => CHUNK_LINE.exec(line)[1]);
   const hex = chunks.join('');
   if (hex.length !== expectedLength * 2 || hex.length % 2 !== 0) {
     throw new Error('panjang payload ALLZXRAA tidak cocok');
