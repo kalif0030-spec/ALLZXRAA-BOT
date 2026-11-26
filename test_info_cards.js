@@ -22,6 +22,7 @@ const fakeNapi = {
 class EmbedBuilder {
   constructor(data = {}) { this.data = { ...data }; }
   setImage(u) { this.data.image = { url: u }; return this; }
+  setColor(c) { this.data.color = c; return this; }
 }
 class AttachmentBuilder {
   constructor(buf, { name }) { this.attachment = buf; this.name = name; }
@@ -71,17 +72,26 @@ res('install memasang pembungkus', info.install({ cards, discord }) === true);
   await i1.reply({ content: 'Halo\nbaris kedua' });
   const p1 = i1.sent[0];
   res('teks biasa dapat file info.png', p1.files.length === 1 && p1.files[0].name === 'info.png');
-  res('teks biasa dapat embed dengan gambar', p1.embeds.length === 1 && p1.embeds[0].data.image.url === 'attachment://info.png');
-  res('pesan asli tetap ada', p1.content === 'Halo\nbaris kedua');
+  res('teks biasa tanpa embed', p1.embeds.length === 0);
+  res('teks pesan dikosongkan (teks ada di kartu)', p1.content === '');
 
   const i2 = new ChatInputCommandInteraction();
   await i2.reply('string saja');
-  res('payload string dinormalisasi', i2.sent[0].content === 'string saja' && i2.sent[0].files.length === 1);
+  res('payload string jadi kartu saja', i2.sent[0].content === '' && i2.sent[0].files.length === 1);
 
   const i3 = new ChatInputCommandInteraction();
   const withFile = { content: 'x', files: [{ name: 'a.png' }] };
   await i3.editReply(withFile);
   res('pesan dengan file dibiarkan', i3.sent[0] === withFile);
+
+  const i8 = new ChatInputCommandInteraction();
+  const withMention = { content: 'Halo <@123>' };
+  await i8.reply(withMention);
+  const afkCard = info.pickTexts(info.forCard({ embeds: [{ data: { description: '💤 <@123> sekarang AFK: makan' } }] }));
+  res('teks kartu AFK tanpa @user', !afkCard.subtitle.includes('@user') && afkCard.subtitle.includes('sekarang AFK: makan'), afkCard.subtitle);
+  res('teks kartu dari content mention tanpa <@', !info.pickTexts(info.forCard({ content: 'Halo <@1>, selamat datang' })).title.includes('<@'));
+  res('pesan dengan mention tetap dapat kartu', i8.sent[0].files.length === 1 && i8.sent[0].embeds.length === 0);
+  res('mention ditaruh sebagai teks di atas gambar', i8.sent[0].content === 'Halo <@123>');
 
   const i4 = new ChatInputCommandInteraction();
   const withImg = { embeds: [{ data: { title: 'T', image: { url: 'https://x' } } }] };
@@ -96,8 +106,8 @@ res('install memasang pembungkus', info.install({ cards, discord }) === true);
   const ch = new TextChannel();
   const emb = new EmbedBuilder({ title: 'Judul', description: 'Deskripsi pendek' });
   await ch.send({ embeds: [emb] });
-  res('channel.send dapat kartu', ch.sent[0].files.length === 1 && emb.data.image.url === 'attachment://info.png');
-  res('judul diambil dari embed', ch.sent[0].files[0].name === 'info.png');
+  res('channel.send dapat kartu', ch.sent[0].files.length === 1 && ch.sent[0].embeds.length === 0);
+      res('judul diambil dari embed', ch.sent[0].files[0].name === 'info.png');
 
   fakeRenderFails = true;
   const i6 = new ChatInputCommandInteraction();
@@ -119,13 +129,25 @@ res('install memasang pembungkus', info.install({ cards, discord }) === true);
   res('thread dapat kartu', th.sent[0].files.length === 1);
   const dm = new DMChannel();
   await dm.send('dm teks');
-  res('DM dapat kartu', dm.sent[0].files.length === 1 && dm.sent[0].content === 'dm teks');
+  res('DM dapat kartu', dm.sent[0].files.length === 1 && dm.sent[0].content === '');
   const u = new User();
   await u.send({ content: 'ke user' });
   res('user.send dapat kartu', u.sent[0].files.length === 1);
   const m = new Message();
   await m.reply({ content: 'balas pesan' });
   res('message.reply dapat kartu', m.sent[0].files.length === 1);
+
+  // pembersihan teks dan warna aksen
+  res('mention role jadi @role', info.cleanText('<@&1550071024257732618> hi') === '@role hi');
+  res('mention user jadi @user', info.cleanText('<@276060004262477825> ok') === '@user ok');
+  res('emoji dibuang dari kartu', info.cleanText('🔓 Channel dibuka lagi.') === 'Channel dibuka lagi.');
+  res('markdown dibuang', info.cleanText('**tebal** ## judul') === 'tebal judul');
+  res('warna embed jadi hex', info.pickAccent({ embeds: [{ data: { color: 0xffe066 } }] }) === '#ffe066');
+  res('tanpa warna: null', info.pickAccent({ content: 'x' }) === null);
+  let accentSeen = null;
+  const cardsSpy = { isAvailable: () => true, renderInfoCard: async (o) => { accentSeen = o.accent; return Buffer.from('png'); } };
+  await info.addCard({ embeds: [new EmbedBuilder({ title: 'T', color: 0xed4245 })] }, { cards: cardsSpy, discord });
+  res('warna embed diteruskan ke renderer', accentSeen === '#ed4245');
 
   console.log({ ok, fail });
 })();
