@@ -13,13 +13,14 @@ const {
   MODE_CHOICES,
   WRAPPER_EXPANSION_LIMIT,
   obfuscateLua,
-  deobfuscateLua,
 } = require('./lua-obfuscator');
 const {
   ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder,
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
   ChannelType, MessageFlags, PermissionFlagsBits, SlashCommandBuilder,
 } = require('discord.js');
+// Setiap balasan bot dapat kartu gambar (lihat info_cards.js). Tanpa @napi-rs/canvas, ini dilewati.
+require('./info_cards').install({ cards, discord: require('discord.js') });
 
 // ============ konstanta ============
 const COLOR_WELCOME = 0x57f287;
@@ -147,6 +148,8 @@ function obfuscate(sourceBuf, cfg, mode = 'allzxraa') {
     banner: BANNER,
   }, mode);
 }
+
+const OBFU_MODE = 'vm2';
 
 // ============ SSRF guard untuk /obfu-link ============
 const blocked = new net.BlockList();
@@ -746,7 +749,7 @@ function obfuFailEmbed(interaction, note) {
 async function handleObfuFile(interaction) {
   await interaction.deferReply();
   const attachment = interaction.options.getAttachment('file', true);
-  const mode = interaction.options.getString('mode') || 'allzxraa';
+  const mode = OBFU_MODE; // satu-satunya mode: VM asli (vm2), tanpa pilihan lain
   if (attachment.size > cfg.obfu.maxSourceBytes) {
     await interaction.editReply({ embeds: [obfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${cfg.obfu.maxSourceBytes} byte.`)] });
     return;
@@ -776,7 +779,7 @@ async function handleObfuFile(interaction) {
 async function handleObfuLink(interaction) {
   await interaction.deferReply();
   const url = interaction.options.getString('url', true);
-  const mode = interaction.options.getString('mode') || 'allzxraa';
+  const mode = OBFU_MODE; // satu-satunya mode: VM asli (vm2), tanpa pilihan lain
   const started = Date.now();
   let buf;
   try {
@@ -793,96 +796,6 @@ async function handleObfuLink(interaction) {
     });
   } catch (err) {
     await interaction.editReply({ embeds: [obfuFailEmbed(interaction, err.message || String(err))] });
-  }
-}
-
-function deobfuResultEmbed(interaction, originalBytes, outputBytes, elapsedMs) {
-  return new EmbedBuilder()
-    .setColor(COLOR_OBFU)
-    .setAuthor({ name: 'Deobfuscate Successful', iconURL: client.user.displayAvatarURL() })
-    .setDescription(`${cfg.brandName} — banner ALLZXRAA tetap disertakan pada hasil deobfuscate.`)
-    .addFields(
-      { name: 'Ukuran Asli', value: `${originalBytes} byte`, inline: true },
-      { name: 'Ukuran Hasil', value: `${outputBytes} byte`, inline: true },
-      { name: 'Waktu Proses', value: `${(elapsedMs / 1000).toFixed(2)}s`, inline: true }
-    )
-    .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
-    .setTimestamp();
-}
-
-function deobfuFailEmbed(interaction, note) {
-  return new EmbedBuilder()
-    .setColor(COLOR_FAIL)
-    .setAuthor({ name: 'Deobfuscate Failed', iconURL: client.user.displayAvatarURL() })
-    .setDescription(String(note).slice(0, 1500))
-    .setFooter({ text: `Requested by ${interaction.user.username} • Powered by ${cfg.poweredBy}`, iconURL: interaction.user.displayAvatarURL() })
-    .setTimestamp();
-}
-
-function deobfuscate(sourceBuf) {
-  return deobfuscateLua(sourceBuf, {
-    banner: BANNER,
-    maxSourceBytes: cfg.obfu.maxSourceBytes,
-  });
-}
-
-function maxObfuWrapperBytes() {
-  return cfg.obfu.maxSourceBytes * WRAPPER_EXPANSION_LIMIT + 64 * 1024;
-}
-
-async function handleDeobfuFile(interaction) {
-  await interaction.deferReply();
-  const attachment = interaction.options.getAttachment('file', true);
-  const maxWrapperBytes = maxObfuWrapperBytes();
-  if (attachment.size > maxWrapperBytes) {
-    await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `File terlalu besar: ${attachment.size} byte > batas ${maxWrapperBytes} byte.`)] });
-    return;
-  }
-
-  const started = Date.now();
-  let buf;
-  try {
-    const res = await fetch(attachment.url, { signal: AbortSignal.timeout(cfg.obfu.requestTimeoutMs) });
-    if (!res.ok) throw new Error(`gagal mengambil attachment (HTTP ${res.status})`);
-    buf = Buffer.from(await res.arrayBuffer());
-  } catch (err) {
-    await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `Gagal membaca file: ${err.message || err.name}`)] });
-    return;
-  }
-
-  try {
-    const outBuf = deobfuscate(buf);
-    const name = attachment.name.replace(/\.lua$/i, '') + '.deobfuscated.lua';
-    await interaction.editReply({
-      embeds: [deobfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started)],
-      files: [new AttachmentBuilder(outBuf, { name })],
-    });
-  } catch (err) {
-    await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, err.message || String(err))] });
-  }
-}
-
-async function handleDeobfuLink(interaction) {
-  await interaction.deferReply();
-  const url = interaction.options.getString('url', true);
-  const started = Date.now();
-  let buf;
-  try {
-    const maxWrapperBytes = maxObfuWrapperBytes();
-    buf = await fetchTextSafe(url, { maxBytes: maxWrapperBytes, timeoutMs: cfg.obfu.requestTimeoutMs });
-  } catch (err) {
-    await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, `Gagal mengambil link: ${err.message}`)] });
-    return;
-  }
-
-  try {
-    const outBuf = deobfuscate(buf);
-    await interaction.editReply({
-      embeds: [deobfuResultEmbed(interaction, buf.length, outBuf.length, Date.now() - started)],
-      files: [new AttachmentBuilder(outBuf, { name: 'deobfuscated.lua' })],
-    });
-  } catch (err) {
-    await interaction.editReply({ embeds: [deobfuFailEmbed(interaction, err.message || String(err))] });
   }
 }
 
@@ -1298,24 +1211,12 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName('obfu-file')
-    .setDescription('Obfuscate file Lua dengan mode pilihan')
-    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true))
-    .addStringOption((o) => o.setName('mode').setDescription('Mode (default: ALLZXRAA lama)')
-      .addChoices(...MODE_CHOICES).setRequired(false)),
+    .setDescription('Obfuscate file Lua ke VM asli (vm2)')
+    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true)),
   new SlashCommandBuilder()
     .setName('obfu-link')
-    .setDescription('Obfuscate source Lua dari link dengan mode pilihan')
-    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true))
-    .addStringOption((o) => o.setName('mode').setDescription('Mode (default: ALLZXRAA lama)')
-      .addChoices(...MODE_CHOICES).setRequired(false)),
-  new SlashCommandBuilder()
-    .setName('deobfu-file')
-    .setDescription('Deobfuscate file dari semua mode ALLZXRAA')
-    .addAttachmentOption((o) => o.setName('file').setDescription('File .lua hasil obfuscate ALLZXRAA').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('deobfu-link')
-    .setDescription('Deobfuscate link raw dari semua mode ALLZXRAA')
-    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi hasil obfuscate ALLZXRAA').setRequired(true)),
+    .setDescription('Obfuscate source Lua dari link ke VM asli (vm2)')
+    .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true)),
   new SlashCommandBuilder()
     .setName('level')
     .setDescription('Lihat level dan XP kamu (atau member lain)')
@@ -1441,10 +1342,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleObfuFile(interaction);
     } else if (interaction.commandName === 'obfu-link') {
       await handleObfuLink(interaction);
-    } else if (interaction.commandName === 'deobfu-file') {
-      await handleDeobfuFile(interaction);
-    } else if (interaction.commandName === 'deobfu-link') {
-      await handleDeobfuLink(interaction);
     } else if (interaction.commandName === 'level') {
       await handleLevel(interaction);
     } else if (interaction.commandName === 'leaderboard') {
@@ -1484,7 +1381,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err));
 
 module.exports = {
-  obfuscate, deobfuscate, handleObfuFile, handleObfuLink, handleDeobfuFile, handleDeobfuLink,
+  obfuscate, handleObfuFile, handleObfuLink,
   levelInfo, progressBar, awardXp, guildRanking,
   handleLevel, handleLeaderboard, awardXp, users, inviteCache, inviteCounts, joinedBy,
   detectInviter, cacheInvites, handleInviteJoin, handleInviteLeave, saveAll,

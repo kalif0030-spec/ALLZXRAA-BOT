@@ -338,12 +338,34 @@ async function renderLeaderboardCard({ guildName, rows }) {
   return canvas.encode('png');
 }
 
+// ============ kartu info (dipakai untuk balasan bot yang belum punya gambar) ============
+// title: teks utama. subtitle: teks kedua (boleh kosong). Gaya sama dengan kartu welcome.
+async function renderInfoCard({ title, subtitle }) {
+  const W = 1000;
+  const H = 380;
+  const canvas = napi.createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  drawTechBackground(ctx, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = font('bold', 40);
+  ctx.fillText(fitText(ctx, title || 'ALLZXRAA', W * 0.9), W / 2, H * 0.52);
+  if (subtitle) {
+    ctx.fillStyle = '#b8c7ff';
+    ctx.font = font('normal', 26);
+    ctx.fillText(fitText(ctx, subtitle, W * 0.9), W / 2, H * 0.66);
+  }
+  return canvas.encode('png');
+}
+
 module.exports = {
   isAvailable,
   renderWelcomeCard,
   renderGoodbyeCard,
   renderLevelCard,
   renderLeaderboardCard,
+  renderInfoCard,
   formatNumber,
   clamp01,
 };
