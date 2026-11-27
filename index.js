@@ -29,13 +29,13 @@ const COLOR_INFO = 0x5865f2;
 
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
-// Pemisahan bot: BOT_ROLE = level | welcome | obfu, satu proses per bot dengan token sendiri.
+// Pemisahan bot: BOT_ROLE = level | welcome | obfu | music, satu proses per bot dengan token sendiri.
 // BOT_ROLE wajib diisi. Tidak ada mode semua-fitur-dalam-satu-proses.
 // .env di folder bot (opsional): dimuat sebelum membaca env. Env dari panel tetap diprioritaskan.
 require('./env-file').loadEnvFile(path.join(__dirname, '.env'));
 // Role yang punya token (env TOKEN_<ROLE> atau "tokens" di config.json, placeholder ISI_ diabaikan).
 function tokenRoles() {
-  const roles = ['level', 'welcome', 'obfu'];
+  const roles = ['level', 'welcome', 'obfu', 'music'];
   const local = readLocalConfig();
   const localTokens = local.tokens && typeof local.tokens === 'object' ? local.tokens : {};
   const usable = (v) => typeof v === 'string' && v.trim() !== '' && !v.startsWith('ISI_');
@@ -67,8 +67,8 @@ if (!process.env.BOT_ROLE && tokenRoles().length > 1) {
   console.log(`[launcher] menjalankan ${roles.length} bot dari satu server: ${roles.join(', ')}`);
   return;
 }
-if (!['level', 'welcome', 'obfu'].includes(BOT_ROLE)) {
-  throw new Error(`Role bot tidak dikenali (BOT_ROLE="${process.env.BOT_ROLE || ''}"). Isi TOKEN_LEVEL, TOKEN_WELCOME, atau TOKEN_OBFU, atau BOT_ROLE = level | welcome | obfu.`);
+if (!['level', 'welcome', 'obfu', 'music'].includes(BOT_ROLE)) {
+  throw new Error(`Role bot tidak dikenali (BOT_ROLE="${process.env.BOT_ROLE || ''}"). Isi TOKEN_LEVEL, TOKEN_WELCOME, TOKEN_OBFU, atau TOKEN_MUSIC, atau BOT_ROLE = level | welcome | obfu | music.`);
 }
 const runs = (feature) => BOT_ROLE === feature;
 // Pemetaan command ke fitur. lock/unlock ikut welcome (manajemen server bersama join/leave/invite).
@@ -86,7 +86,7 @@ const COMMAND_FEATURE = {
   'obfu-file': 'obfu',
   'obfu-link': 'obfu',
   'obfu-panel': 'obfu',
-  voice: 'welcome',
+  voice: 'music',
 };
 const XP_DATA_FILE = path.join(__dirname, 'xp-data.json');
 const INVITE_DATA_FILE = path.join(__dirname, 'invite-data.json');
@@ -965,8 +965,9 @@ const OBFU_PANEL_DESCRIPTION = [
   '⚠️ Hasil obfuscate **bukan jaminan 100% nggak bisa dibongkar**, tapi bikin orang awam jauh lebih susah baca / nyolong script kamu.',
 ].join('\n');
 
-// Banner panel: URL dari OBFU_BANNER_URL kalau diisi, kalau tidak pakai assets/banner.png di zip.
-const OBFU_BANNER_FILE = path.join(__dirname, 'assets', 'banner.png');
+// Banner panel: URL dari OBFU_BANNER_URL kalau diisi. Kalau tidak, pakai assets/banner.gif kalau ada (GIF tampil looping di embed),
+// lalu fallback ke assets/banner.png. Embed Discord tidak bisa menampilkan mp4.
+const OBFU_BANNER_CANDIDATES = ['banner.gif', 'banner.png'].map((name) => ({ name, file: path.join(__dirname, 'assets', name) }));
 
 function obfuPanelPayload() {
   const embed = new EmbedBuilder()
@@ -977,9 +978,12 @@ function obfuPanelPayload() {
   const files = [];
   if (cfg.obfuBannerUrl) {
     embed.setImage(cfg.obfuBannerUrl);
-  } else if (fs.existsSync(OBFU_BANNER_FILE)) {
-    files.push(new AttachmentBuilder(OBFU_BANNER_FILE, { name: 'banner.png' }));
-    embed.setImage('attachment://banner.png');
+  } else {
+    const banner = OBFU_BANNER_CANDIDATES.find((c) => fs.existsSync(c.file));
+    if (banner) {
+      files.push(new AttachmentBuilder(banner.file, { name: banner.name }));
+      embed.setImage(`attachment://${banner.name}`);
+    }
   }
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('obfu:paste').setLabel('Paste Script').setEmoji('📋').setStyle(ButtonStyle.Primary),
@@ -1596,7 +1600,9 @@ loadAfk();
 
 const ROLE_INTENTS = {
   level: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-  welcome: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildVoiceStates],
+  welcome: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites],
+  // Music: voice stay dan pemutaran lagu. Butuh GuildVoiceStates untuk masuk dan memantau voice channel.
+  music: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   // MessageContent wajib: tanpa itu Discord mengosongkan msg.attachments, jadi tombol Upload File tidak pernah melihat file .lua.
   obfu: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 };
@@ -1900,7 +1906,7 @@ if (runs('obfu')) {
 client.once(Events.ClientReady, async (c) => {
   await c.application.commands.set(commands.filter((cmd) => runs(COMMAND_FEATURE[cmd.name])).map((cmd) => cmd.toJSON()));
   if (runs('welcome')) for (const guild of c.guilds.cache.values()) await initGuildInvites(guild);
-  if (runs('welcome') && voiceLib) {
+  if (runs('music') && voiceLib) {
     for (const [guildId, st] of voiceStates) {
       const guild = c.guilds.cache.get(guildId);
       if (!guild) continue;

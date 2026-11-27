@@ -3,7 +3,8 @@
   "tokens": {
     "level": "ISI_TOKEN_BOT_LEVEL",
     "welcome": "ISI_TOKEN_BOT_WELCOME",
-    "obfu": "ISI_TOKEN_BOT_OBFU"
+    "obfu": "ISI_TOKEN_BOT_OBFU",
+    "music": "ISI_TOKEN_BOT_MUSIC"
   },
   "welcomeChannelId": "",
   "goodbyeChannelId": "",
