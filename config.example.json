@@ -1,0 +1,16 @@
+{
+  "token": "ISI_TOKEN_MODE_SATU_PROSES",
+  "tokens": {
+    "level": "ISI_TOKEN_BOT_LEVEL",
+    "welcome": "ISI_TOKEN_BOT_WELCOME",
+    "obfu": "ISI_TOKEN_BOT_OBFU"
+  },
+  "welcomeChannelId": "",
+  "goodbyeChannelId": "",
+  "inviteLogChannelId": "",
+  "levelUpChannelId": "",
+  "levelCommandChannelId": "",
+  "xpChannelId": "",
+  "brandName": "ALLZXRAA COMMUNITY",
+  "poweredBy": "ALLZXRAA COMMUNITY"
+}

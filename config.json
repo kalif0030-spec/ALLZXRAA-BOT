@@ -1,0 +1,15 @@
+{
+  "tokens": {
+    "level": "ISI_TOKEN_BOT_LEVEL",
+    "welcome": "ISI_TOKEN_BOT_WELCOME",
+    "obfu": "ISI_TOKEN_BOT_OBFU"
+  },
+  "welcomeChannelId": "1540584065068048405",
+  "goodbyeChannelId": "1540584065068048405",
+  "inviteLogChannelId": "1574202934365790258",
+  "levelUpChannelId": "1575138185913307186",
+  "levelCommandChannelId": "1540585404908970004",
+  "xpChannelId": "1575141066666156032",
+  "brandName": "ALLZXRAA COMMUNITY",
+  "poweredBy": "ALLZXRAA COMMUNITY"
+}

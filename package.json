@@ -1,0 +1,17 @@
+{
+  "name": "allzxraa-bot",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node tests/test_music.js && node tests/test_voice_stay.js && node tests/test_info_cards.js && node tests/test_music_url.js && node tests/test_card_text.js && node tests/test_obfuscate_club_api.js && node tests/test_nttobf_api.js && node tests/test_env_file.js"
+  },
+  "dependencies": {
+    "discord.js": "latest",
+    "@discordjs/voice": "latest",
+    "libsodium-wrappers": "latest",
+    "opusscript": "latest",
+    "ffmpeg-static": "latest",
+    "@napi-rs/canvas": "latest"
+  }
+}
