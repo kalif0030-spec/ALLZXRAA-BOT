@@ -1743,18 +1743,21 @@ async function handleVoice(interaction) {
   const fail = (text) => interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
 
   if (sub === 'join') {
+    // Join butuh beberapa panggilan jaringan (fetch channel, member, koneksi voice) yang bisa lebih dari 3 detik.
+    // Discord menganggap interaksi gagal kalau tidak dibalas dalam 3 detik, jadi defer dulu, lalu editReply.
+    await interaction.deferReply();
     const channel = interaction.options.getChannel('kanal', true);
     voiceStates.set(guild.id, { channelId: channel.id });
     const res = await joinStay(guild, channel.id);
     if (!res.ok) {
       voiceStates.delete(guild.id);
-      return fail(`Bot tidak bisa masuk voice: ${res.reason}.`);
+      return interaction.editReply({ content: `Bot tidak bisa masuk voice: ${res.reason}.` });
     }
     voiceSaver.save();
     const musicNote = !music.enabled ? ''
       : music.trackCount() > 0 ? ` Lagu diputar acak dari folder music (${music.trackCount()} file).`
         : ' Folder music masih kosong, taruh file lagu di sana supaya bot mulai memutar.';
-    return interaction.reply({ content: `Bot sekarang stay di voice ${res.channelName}. Bot tetap di sana sampai di-kick dari voice atau kamu pakai /voice leave. Kalau cuma putus koneksi, bot masuk lagi otomatis.${musicNote}`, allowedMentions: { parse: [] } });
+    return interaction.editReply({ content: `Bot sekarang stay di voice ${res.channelName}. Bot tetap di sana sampai di-kick dari voice atau kamu pakai /voice leave. Kalau cuma putus koneksi, bot masuk lagi otomatis.${musicNote}`, allowedMentions: { parse: [] } });
   }
 
   if (sub === 'leave') {
