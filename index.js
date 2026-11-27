@@ -1,6 +1,6 @@
 'use strict';
 
-// Satu file: welcome/goodbye, obfuscate Lua (api.nttobf.com), obfu link aman dari SSRF, sistem XP + level + leaderboard, dan invite log.
+// Satu file: welcome/goodbye, obfuscate Lua (loader chunk lokal), obfu link aman dari SSRF, sistem XP + level + leaderboard, dan invite log.
 
 const crypto = require('node:crypto');
 const dns = require('node:dns').promises;
@@ -9,8 +9,7 @@ const net = require('node:net');
 const { Readable } = require('node:stream');
 const path = require('node:path');
 const cards = require('./cards');
-const { obfuscateWithNtt, getNttQueue } = require('./nttobf-api');
-const { addLuaBanner } = require('./obfuscate-club-api');
+const { obfuscateWithChunks } = require('./chunk-api');
 const {
   ContainerBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder,
   AttachmentBuilder, Client, EmbedBuilder, Events, GatewayIntentBits,
@@ -840,17 +839,14 @@ async function obfuPayload(interaction, { ok, title, lines, files = [] }) {
   return payload;
 }
 
-// Obfuscate lewat api.nttobf.com.
+// Obfuscate lokal: loader chunk hex + decoder. Tidak butuh jaringan atau API key.
 async function obfuscateJob(buf, cfg) {
-  const queue = await getNttQueue();
-  console.log('[obfu] antrean nttobf:', JSON.stringify(queue));
-  const raw = await obfuscateWithNtt(buf);
-  const out = addLuaBanner(raw, cfg.brandName);
-  return { out, usedMode: 'nttobf-api', fallbackReason: null, queue };
+  const out = obfuscateWithChunks(buf, { brandName: cfg.brandName });
+  return { out, usedMode: 'chunk-local', fallbackReason: null };
 }
 
 async function obfuSuccessMessage(interaction, usedMode, originalBytes, outputBytes, elapsedMs, fallbackReason, files) {
-  const modeName = 'api.nttobf.com';
+  const modeName = 'loader chunk lokal';
   const lines = [
     `${cfg.brandName} — mode obfuscate: ${modeName}.`,
     `Ukuran Asli ${originalBytes} byte • Ukuran Hasil ${outputBytes} byte • Waktu ${(elapsedMs / 1000).toFixed(2)}s`,
@@ -963,7 +959,7 @@ const OBFU_PANEL_DESCRIPTION = [
   '» Klik **Upload File** buat script panjang (file .lua)',
   '» Klik **Link** buat script dari link raw (GitHub raw, pastebin raw, dll)',
   '',
-  '✅ Script diobfuscate lewat api.nttobf.com',
+  '✅ Script diobfuscate lewat loader chunk lokal',
   '✅ Hasilnya cuma dikirim ke kamu (pesan pribadi)',
   '',
   '⚠️ Hasil obfuscate **bukan jaminan 100% nggak bisa dibongkar**, tapi bikin orang awam jauh lebih susah baca / nyolong script kamu.',
@@ -1789,11 +1785,11 @@ loadVoiceState();
 const commands = [
   new SlashCommandBuilder()
     .setName('obfu-file')
-    .setDescription('Obfuscate file Lua lewat api.nttobf.com')
+    .setDescription('Obfuscate file Lua pakai loader chunk lokal')
     .addAttachmentOption((o) => o.setName('file').setDescription('File .lua yang mau di-obfuscate').setRequired(true)),
   new SlashCommandBuilder()
     .setName('obfu-link')
-    .setDescription('Obfuscate source Lua dari link lewat api.nttobf.com')
+    .setDescription('Obfuscate source Lua dari link pakai loader chunk lokal')
     .addStringOption((o) => o.setName('url').setDescription('Link raw berisi source Lua').setRequired(true)),
   new SlashCommandBuilder()
     .setName('obfu-panel')
