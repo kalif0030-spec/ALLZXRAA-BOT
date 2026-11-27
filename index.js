@@ -1597,7 +1597,8 @@ loadAfk();
 const ROLE_INTENTS = {
   level: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   welcome: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildVoiceStates],
-  obfu: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  // MessageContent wajib: tanpa itu Discord mengosongkan msg.attachments, jadi tombol Upload File tidak pernah melihat file .lua.
+  obfu: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 };
 
 const client = new Client({
