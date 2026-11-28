@@ -905,6 +905,7 @@ async function handleObfuLink(interaction) {
 
 // ============ link audio untuk /voice play ============
 // Sama seperti /obfu-link: host dicek lewat resolvePublic, dan setiap hop redirect dicek ulang.
+const ytdlp = require('./ytdlp');
 const MUSIC_URL_MAX_REDIRECTS = 5;
 const MUSIC_URL_CONNECT_MS = 15_000;
 
@@ -913,6 +914,7 @@ const MUSIC_URL_CONNECT_MS = 15_000;
 async function openMusicUrl(raw) {
   let url = parseHttpUrl(raw);
   if (url === null) throw new Error('itu bukan link http(s) yang valid');
+  if (ytdlp.supports(url)) return ytdlp.open(url.href); // YouTube, SoundCloud, dll lewat yt-dlp
   let res = null;
   for (let hop = 0; ; hop++) {
     const check = await resolvePublic(url.hostname);
@@ -944,7 +946,7 @@ async function openMusicUrl(raw) {
   const type = res.headers.get('content-type') || '';
   if (/^text\/|html|json/i.test(type)) {
     await res.body?.cancel().catch(() => {});
-    throw new Error('link ini halaman web, bukan file audio langsung. Pakai link file audio seperti .mp3 atau .ogg');
+    throw new Error('link ini halaman web yang tidak didukung. Pakai YouTube/SoundCloud atau link file audio langsung (.mp3, .ogg)');
   }
   if (!res.body) throw new Error('respons tidak punya body yang bisa dibaca');
   return Readable.fromWeb(res.body);
@@ -1624,6 +1626,7 @@ try {
   voiceLib = null;
 }
 const musicOff = /^(off|0|false|no)$/i.test(process.env.MUSIC_ENABLED ?? '');
+if (!musicOff && voiceLib && runs('music')) ytdlp.ensureFfmpeg();
 const { urlTitle } = require('./music');
 const music = require('./music').createMusic({
   voiceLib: musicOff ? null : voiceLib,
@@ -1887,8 +1890,8 @@ const commands = [
       .addChannelOption((o) => o.setName('kanal').setDescription('Voice channel').setRequired(true).addChannelTypes(ChannelType.GuildVoice)))
     .addSubcommand((sub) => sub.setName('leave').setDescription('Bot keluar dari voice dan berhenti stay'))
     .addSubcommand((sub) => sub.setName('status').setDescription('Lihat status stay bot'))
-    .addSubcommand((sub) => sub.setName('play').setDescription('Putar link file audio (setelah lagu sekarang)')
-      .addStringOption((o) => o.setName('url').setDescription('Link file audio langsung, misal .mp3 atau .ogg').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('play').setDescription('Putar link YouTube/SoundCloud atau file audio (setelah lagu sekarang)')
+      .addStringOption((o) => o.setName('url').setDescription('Link YouTube, SoundCloud, atau file audio langsung (.mp3, .ogg)').setRequired(true)))
     .addSubcommand((sub) => sub.setName('skip').setDescription('Lewati lagu yang sedang diputar')),
 ];
 
