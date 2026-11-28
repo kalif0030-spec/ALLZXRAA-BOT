@@ -82,8 +82,29 @@ function resolveFfmpeg() {
   return ffmpegPath;
 }
 
+// Batas memori proses (cgroup/container) dalam byte, atau 0 kalau tidak diketahui.
+function memoryLimitBytes() {
+  try {
+    const v = typeof process.constrainedMemory === 'function' ? process.constrainedMemory() : 0;
+    return Number.isFinite(v) && v > 0 && v < 2 ** 52 ? v : 0;   // nilai raksasa = tanpa batas
+  } catch {
+    return 0;
+  }
+}
+
+// palettegen menahan semua frame banner di RAM, jadi di server kecil mode animasi mati dengan sendiri.
+// CARD_ANIMATED=on memaksa aktif, off memaksa mati.
+const LOW_MEMORY_BYTES = 1024 * 1024 * 1024;
+function animationEnabled() {
+  const v = String(process.env.CARD_ANIMATED || '').toLowerCase();
+  if (v === 'off') return false;
+  if (v === 'on') return true;
+  const limit = memoryLimitBytes();
+  return !(limit > 0 && limit < LOW_MEMORY_BYTES);
+}
+
 function isReady() {
-  if (String(process.env.CARD_ANIMATED || '').toLowerCase() === 'off') return false;
+  if (!animationEnabled()) return false;
   if (!fs.existsSync(BANNER_GIF)) return false;
   return resolveFfmpeg() !== null;
 }
@@ -200,6 +221,8 @@ async function composeGif(overlayPng, w, h, { budgetMs = DEFAULT_BUDGET_MS } = {
 
 module.exports = {
   isReady,
+  animationEnabled,
+  memoryLimitBytes,
   resolveFfmpeg,
   composeGif,
   buildFilter,

@@ -65,6 +65,11 @@ if (!process.env.BOT_ROLE && tokenRoles().length > 1) {
   process.on('SIGTERM', () => { stopAll(); process.exit(0); });
   process.on('SIGINT', () => { stopAll(); process.exit(0); });
   console.log(`[launcher] menjalankan ${roles.length} bot dari satu server: ${roles.join(', ')}`);
+  {
+    const animate = require('./animate.js');
+    const limit = animate.memoryLimitBytes();
+    console.log(`[launcher] batas memori: ${limit ? Math.round(limit / 1048576) + ' MB' : 'tidak diketahui'}; kartu animasi: ${animate.animationEnabled() ? 'aktif' : 'nonaktif (PNG statis)'}`);
+  }
   return;
 }
 if (!['level', 'welcome', 'obfu', 'music'].includes(BOT_ROLE)) {
@@ -1001,8 +1006,9 @@ async function handleObfuPanel(interaction) {
   if (!interaction.channel || !interaction.channel.isTextBased()) {
     return interaction.reply({ content: 'Panel cuma bisa dipasang di channel teks.', flags: MessageFlags.Ephemeral });
   }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   await interaction.channel.send(obfuPanelPayload());
-  return interaction.reply({ content: 'Panel obfuscate sudah dipasang di channel ini.', flags: MessageFlags.Ephemeral });
+  return interaction.editReply({ content: 'Panel obfuscate sudah dipasang di channel ini.' });
 }
 
 async function showObfuPasteModal(interaction) {

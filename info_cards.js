@@ -10,6 +10,9 @@ const IMAGE_BASE = 'info';   // ekstensi (.gif atau .png) mengikuti isi hasil re
 // Balasan pertama ke interaksi harus terkirim dalam 3 detik. Anggaran render GIF dibuat ketat di jalur itu;
 // terlewati, kartu jatuh ke PNG statis. Nilai ini belum dikalibrasi di server nyata.
 const TIGHT_BUDGET_MS = 1600;
+const ACK_WINDOW_MS = 3000;   // batas Discord untuk balasan pertama
+const ACK_SAFETY_MS = 400;    // sisa untuk selisih jam dan jaringan
+const MIN_CARD_MS = 600;      // sama dengan MIN_ATTEMPT_MS di animate.js
 
 function normalize(payload) {
   if (payload === undefined || payload === null) return { content: '' };
@@ -170,10 +173,17 @@ function install({ cards, discord }) {
       if (typeof proto[method] !== 'function' || proto[method][MARK]) continue;
       const orig = proto[method];
       const wrapped = async function wrappedWithCard(payload, ...rest) {
-        let next = payload;
         const firstReply = method === 'reply' && this.deferred === false && this.replied === false;
+        let budgetMs;
+        if (firstReply) {
+          // Balasan pertama harus sampai ke Discord dalam 3 detik sejak interaction dibuat.
+          const age = Date.now() - (Number.isFinite(this.createdTimestamp) ? this.createdTimestamp : Date.now());
+          budgetMs = Math.min(TIGHT_BUDGET_MS, ACK_WINDOW_MS - ACK_SAFETY_MS - age);
+          if (!(budgetMs >= MIN_CARD_MS)) return orig.call(this, payload, ...rest);   // waktu habis: kirim tanpa kartu
+        }
+        let next = payload;
         try {
-          next = await addCard(payload, { cards, discord, budgetMs: firstReply ? TIGHT_BUDGET_MS : undefined });
+          next = await addCard(payload, { cards, discord, budgetMs });
         } catch {
           next = payload;
         }
