@@ -48,7 +48,7 @@ function inferBotRole() {
   return roles.length === 1 ? roles[0] : '';
 }
 const BOT_ROLE = (process.env.BOT_ROLE || inferBotRole()).trim().toLowerCase();
-if (BOT_ROLE) process.env.BOT_ROLE = BOT_ROLE;   // dibaca animate.js untuk memutuskan GIF atau PNG
+if (BOT_ROLE) process.env.BOT_ROLE = BOT_ROLE;   // dibaca animate.js: GIF hanya untuk bot obfu
 
 // Satu server, banyak token: tanpa BOT_ROLE dan token untuk lebih dari satu role, file ini jadi launcher.
 // Tiap bot dijalankan sebagai proses sendiri dengan BOT_ROLE-nya. Top-level return valid di CommonJS.
@@ -66,12 +66,6 @@ if (!process.env.BOT_ROLE && tokenRoles().length > 1) {
   process.on('SIGTERM', () => { stopAll(); process.exit(0); });
   process.on('SIGINT', () => { stopAll(); process.exit(0); });
   console.log(`[launcher] menjalankan ${roles.length} bot dari satu server: ${roles.join(', ')}`);
-  {
-    const animate = require('./animate.js');
-    const limit = animate.memoryLimitBytes();
-    const gifRoles = roles.filter((r) => animate.animationEnabled(r));
-    console.log(`[launcher] batas memori: ${limit ? Math.round(limit / 1048576) + ' MB' : 'tidak diketahui'}; kartu GIF: ${gifRoles.length ? gifRoles.join(', ') : 'tidak ada'}; role lain pakai PNG statis`);
-  }
   return;
 }
 if (!['level', 'welcome', 'obfu', 'music'].includes(BOT_ROLE)) {
@@ -1004,6 +998,7 @@ function obfuPanelPayload() {
 }
 
 async function handleObfuPanel(interaction) {
+  if (!interaction.guild) return interaction.reply({ content: 'Perintah ini cuma bisa dipakai di server.', flags: MessageFlags.Ephemeral });
   if (!isServerAdmin(interaction)) return interaction.reply({ content: 'Cuma owner atau admin yang bisa pasang panel ini.', flags: MessageFlags.Ephemeral });
   if (!interaction.channel || !interaction.channel.isTextBased()) {
     return interaction.reply({ content: 'Panel cuma bisa dipasang di channel teks.', flags: MessageFlags.Ephemeral });

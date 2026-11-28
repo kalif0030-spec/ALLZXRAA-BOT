@@ -17,8 +17,7 @@ const BANNER_GIF = process.env.CARD_BANNER_GIF || path.join(__dirname, 'assets',
 
 // Asumsi, belum dikonfirmasi di server ini: batas upload bot 10 MB. Sisakan ruang untuk overhead multipart.
 const MAX_GIF_BYTES = 7 * 1024 * 1024;
-// proses ffmpeg bersamaan per bot; satu saja kalau batas memori server di bawah 1 GB (palettegen menahan semua frame di RAM)
-const MAX_PARALLEL = (() => { const l = memoryLimitBytes(); return l > 0 && l < 1024 ** 3 ? 1 : 2; })();
+const MAX_PARALLEL = 2;          // proses ffmpeg bersamaan
 const CACHE_MAX = 12;            // GIF identik (mis. pesan error yang sama) tidak dirender ulang
 const DEFAULT_BUDGET_MS = 20000;
 const MIN_ATTEMPT_MS = 600;      // sisa waktu di bawah ini: tidak mulai percobaan baru
@@ -83,20 +82,10 @@ function resolveFfmpeg() {
   return ffmpegPath;
 }
 
-// Batas memori proses (cgroup/container) dalam byte, atau 0 kalau tidak diketahui.
-function memoryLimitBytes() {
-  try {
-    const v = typeof process.constrainedMemory === 'function' ? process.constrainedMemory() : 0;
-    return Number.isFinite(v) && v > 0 && v < 2 ** 52 ? v : 0;   // nilai raksasa = tanpa batas
-  } catch {
-    return 0;
-  }
-}
-
-// GIF hanya untuk bot yang memang butuh (default: level dan obfu). Bot lain memakai kartu PNG statis.
+// GIF hanya untuk bot obfu (default); bot lain memakai kartu PNG statis.
 // CARD_ANIMATED=off mematikan semua, CARD_ANIMATED=on menyalakan untuk semua role,
-// CARD_ANIMATED_ROLES=level,obfu mengganti daftar role (pisah koma). Role kosong (tidak diketahui) dianggap boleh.
-const DEFAULT_ANIMATED_ROLES = 'level,obfu';
+// CARD_ANIMATED_ROLES=obfu,level mengganti daftar role (pisah koma). Role kosong (tidak diketahui) dianggap boleh.
+const DEFAULT_ANIMATED_ROLES = 'obfu';
 function animationEnabled(role = process.env.BOT_ROLE) {
   const v = String(process.env.CARD_ANIMATED || '').toLowerCase();
   if (v === 'off') return false;
@@ -226,7 +215,6 @@ async function composeGif(overlayPng, w, h, { budgetMs = DEFAULT_BUDGET_MS } = {
 module.exports = {
   isReady,
   animationEnabled,
-  memoryLimitBytes,
   resolveFfmpeg,
   composeGif,
   buildFilter,

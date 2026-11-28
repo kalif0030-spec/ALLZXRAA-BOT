@@ -4,8 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node tests/test_music.js && node tests/test_voice_stay.js && node tests/test_info_cards.js && node tests/test_music_url.js && node tests/test_card_text.js && node tests/test_banner.js && node tests/test_chunk_api.js && node tests/test_env_file.js && node tests/test_ytdlp.js && node tests/test_animate.js && node tests/test_card_gif.js && node tests/test_static_background.js",
-    "server-profile": "node tools/server-profile.js"
+    "test": "node tests/test_music.js && node tests/test_voice_stay.js && node tests/test_info_cards.js && node tests/test_music_url.js && node tests/test_card_text.js && node tests/test_banner.js && node tests/test_chunk_api.js && node tests/test_env_file.js && node tests/test_ytdlp.js && node tests/test_animate.js && node tests/test_card_gif.js"
   },
   "dependencies": {
     "discord.js": "latest",

@@ -2,8 +2,7 @@
 
 // Kartu gambar untuk welcome, goodbye, level, leaderboard, obfuscate, dan info.
 // Bergaya banner: latarnya frame banner.gif, jadi kartu keluar sebagai GIF animasi (lihat animate.js).
-// Hanya bot level dan obfu yang membuat GIF; bot lain (dan kalau ffmpeg atau banner.gif tidak ada) kartu keluar
-// sebagai PNG statis dengan latar assets/banner.png (atau laut gambar sendiri kalau file itu tidak ada).
+// Tanpa ffmpeg atau banner.gif, kartu keluar sebagai PNG statis dengan latar laut yang digambar sendiri.
 // Pakai @napi-rs/canvas (binary prebuilt, tanpa dependency sistem). Kalau paketnya belum
 // terpasang, isAvailable() bernilai false dan index.js jatuh ke embed lama.
 //
@@ -139,24 +138,6 @@ function mulberry32(seed) {
   };
 }
 
-// Latar kartu statis: assets/banner.png (cover-crop sama seperti filter ffmpeg: ke tengah, agak condong ke atas).
-// Dimuat sekali di belakang layar; selama belum siap atau file tidak ada, dipakai laut gambar sendiri.
-const BANNER_PNG = process.env.CARD_BANNER_PNG || path.join(__dirname, 'assets', 'banner.png');
-let bannerImage = null;
-if (napi && typeof napi.loadImage === 'function' && fs.existsSync(BANNER_PNG)) {
-  napi.loadImage(BANNER_PNG).then((img) => { bannerImage = img; }).catch(() => { bannerImage = null; });
-}
-
-function drawStaticBackground(ctx, w, h) {
-  const iw = bannerImage && bannerImage.width;
-  const ih = bannerImage && bannerImage.height;
-  if (!(iw > 0 && ih > 0)) { drawStaticSea(ctx, w, h); return; }
-  const scale = Math.max(w / iw, h / ih);
-  const dw = iw * scale;
-  const dh = ih * scale;
-  ctx.drawImage(bannerImage, (w - dw) / 2, -(dh - h) * 0.25, dw, dh);
-}
-
 function drawStaticSea(ctx, w, h) {
   const rand = mulberry32(0x51ea5eed);
   const base = ctx.createLinearGradient(0, 0, 0, h);
@@ -210,7 +191,7 @@ function beginCard(W, H, variant = 'left') {
   const animated = animate.isReady();
   const canvas = napi.createCanvas(W, H);
   const ctx = canvas.getContext('2d');
-  if (!animated) drawStaticBackground(ctx, W, H);
+  if (!animated) drawStaticSea(ctx, W, H);
   drawScrim(ctx, W, H, variant);
   return { canvas, ctx, animated };
 }
@@ -226,7 +207,7 @@ async function finishCard({ canvas, animated }, { budgetMs } = {}) {
     console.warn('kartu animasi gagal, pakai PNG statis:', err.message);
     const flat = napi.createCanvas(canvas.width, canvas.height);
     const fctx = flat.getContext('2d');
-    drawStaticBackground(fctx, canvas.width, canvas.height);
+    drawStaticSea(fctx, canvas.width, canvas.height);
     fctx.drawImage(canvas, 0, 0);
     return flat.encode('png');
   }
