@@ -17,7 +17,8 @@ const BANNER_GIF = process.env.CARD_BANNER_GIF || path.join(__dirname, 'assets',
 
 // Asumsi, belum dikonfirmasi di server ini: batas upload bot 10 MB. Sisakan ruang untuk overhead multipart.
 const MAX_GIF_BYTES = 7 * 1024 * 1024;
-const MAX_PARALLEL = 2;          // proses ffmpeg bersamaan
+// proses ffmpeg bersamaan per bot; satu saja kalau batas memori server di bawah 1 GB (palettegen menahan semua frame di RAM)
+const MAX_PARALLEL = (() => { const l = memoryLimitBytes(); return l > 0 && l < 1024 ** 3 ? 1 : 2; })();
 const CACHE_MAX = 12;            // GIF identik (mis. pesan error yang sama) tidak dirender ulang
 const DEFAULT_BUDGET_MS = 20000;
 const MIN_ATTEMPT_MS = 600;      // sisa waktu di bawah ini: tidak mulai percobaan baru
@@ -92,15 +93,18 @@ function memoryLimitBytes() {
   }
 }
 
-// palettegen menahan semua frame banner di RAM, jadi di server kecil mode animasi mati dengan sendiri.
-// CARD_ANIMATED=on memaksa aktif, off memaksa mati.
-const LOW_MEMORY_BYTES = 1024 * 1024 * 1024;
-function animationEnabled() {
+// GIF hanya untuk bot yang memang butuh (default: level dan obfu). Bot lain memakai kartu PNG statis.
+// CARD_ANIMATED=off mematikan semua, CARD_ANIMATED=on menyalakan untuk semua role,
+// CARD_ANIMATED_ROLES=level,obfu mengganti daftar role (pisah koma). Role kosong (tidak diketahui) dianggap boleh.
+const DEFAULT_ANIMATED_ROLES = 'level,obfu';
+function animationEnabled(role = process.env.BOT_ROLE) {
   const v = String(process.env.CARD_ANIMATED || '').toLowerCase();
   if (v === 'off') return false;
   if (v === 'on') return true;
-  const limit = memoryLimitBytes();
-  return !(limit > 0 && limit < LOW_MEMORY_BYTES);
+  const r = String(role || '').trim().toLowerCase();
+  if (!r) return true;
+  const list = String(process.env.CARD_ANIMATED_ROLES ?? DEFAULT_ANIMATED_ROLES).split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  return list.includes(r);
 }
 
 function isReady() {

@@ -48,6 +48,7 @@ function inferBotRole() {
   return roles.length === 1 ? roles[0] : '';
 }
 const BOT_ROLE = (process.env.BOT_ROLE || inferBotRole()).trim().toLowerCase();
+if (BOT_ROLE) process.env.BOT_ROLE = BOT_ROLE;   // dibaca animate.js untuk memutuskan GIF atau PNG
 
 // Satu server, banyak token: tanpa BOT_ROLE dan token untuk lebih dari satu role, file ini jadi launcher.
 // Tiap bot dijalankan sebagai proses sendiri dengan BOT_ROLE-nya. Top-level return valid di CommonJS.
@@ -68,7 +69,8 @@ if (!process.env.BOT_ROLE && tokenRoles().length > 1) {
   {
     const animate = require('./animate.js');
     const limit = animate.memoryLimitBytes();
-    console.log(`[launcher] batas memori: ${limit ? Math.round(limit / 1048576) + ' MB' : 'tidak diketahui'}; kartu animasi: ${animate.animationEnabled() ? 'aktif' : 'nonaktif (PNG statis)'}`);
+    const gifRoles = roles.filter((r) => animate.animationEnabled(r));
+    console.log(`[launcher] batas memori: ${limit ? Math.round(limit / 1048576) + ' MB' : 'tidak diketahui'}; kartu GIF: ${gifRoles.length ? gifRoles.join(', ') : 'tidak ada'}; role lain pakai PNG statis`);
   }
   return;
 }
