@@ -598,7 +598,7 @@ async function postInviteLog(guild, embed, card) {
         subtitle: card.subtitle,
         accent: '#' + COLOR_INVITE.toString(16).padStart(6, '0'),
       });
-      payload.files = [new AttachmentBuilder(png, { name: 'invite.png' })];
+      payload.files = [new AttachmentBuilder(png, { name: cards.cardFileName('invite', png) })];
     } catch (err) {
       console.error('kartu invite gagal, kirim embed saja:', err.message);
     }
@@ -762,7 +762,7 @@ async function sendWelcome(member) {
       // Teks (dengan mention) di atas gambar, tanpa embed.
       await channel.send({
         content: `## Selamat datang ${member} di **${member.guild.name}**!\nSemoga betah ya, kamu member ke-${member.guild.memberCount}.`,
-        files: [new AttachmentBuilder(png, { name: 'welcome.png' })],
+        files: [new AttachmentBuilder(png, { name: cards.cardFileName('welcome', png) })],
         allowedMentions: { parse: [] },
       });
       return;
@@ -798,7 +798,7 @@ async function sendGoodbye(member) {
       });
       await channel.send({
         content: `## **${cardName(member.user)}** telah keluar dari server\nSampai jumpa lagi! ❤️`,
-        files: [new AttachmentBuilder(png, { name: 'goodbye.png' })],
+        files: [new AttachmentBuilder(png, { name: cards.cardFileName('goodbye', png) })],
         allowedMentions: { parse: [] },
       });
       return;
@@ -829,7 +829,7 @@ async function obfuPayload(interaction, { ok, title, lines, files = [] }) {
         title,
         lines,
       });
-      payload.files.unshift(new AttachmentBuilder(png, { name: 'obfu.png' }));
+      payload.files.unshift(new AttachmentBuilder(png, { name: cards.cardFileName('obfu', png) }));
       return payload;
     } catch (err) {
       console.error('obfu card gagal, kirim teks:', err.message);
@@ -1255,7 +1255,7 @@ async function levelCardFile(user, guildId) {
     span: info.span,
     ratio: info.ratio,
   });
-  return new AttachmentBuilder(png, { name: 'level.png' });
+  return new AttachmentBuilder(png, { name: cards.cardFileName('level', png) });
 }
 
 async function leaderboardCardFile(guild) {
@@ -1266,7 +1266,7 @@ async function leaderboardCardFile(guild) {
     return { name: who.name, avatarUrl: who.avatarUrl, level: info.level, xp: r.xp, ratio: info.ratio };
   }));
   const png = await cards.renderLeaderboardCard({ guildName: guild.name, rows });
-  return new AttachmentBuilder(png, { name: 'leaderboard.png' });
+  return new AttachmentBuilder(png, { name: cards.cardFileName('leaderboard', png) });
 }
 
 async function handleLevel(interaction) {

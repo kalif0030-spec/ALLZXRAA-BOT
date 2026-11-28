@@ -6,7 +6,10 @@
 
 const MARK = Symbol('infoCardInstalled');
 const IS_COMPONENTS_V2 = 1 << 15;   // MessageFlags.IsComponentsV2
-const IMAGE_NAME = 'info.png';
+const IMAGE_BASE = 'info';   // ekstensi (.gif atau .png) mengikuti isi hasil render
+// Balasan pertama ke interaksi harus terkirim dalam 3 detik. Anggaran render GIF dibuat ketat di jalur itu;
+// terlewati, kartu jatuh ke PNG statis. Nilai ini belum dikalibrasi di server nyata.
+const TIGHT_BUDGET_MS = 1600;
 
 function normalize(payload) {
   if (payload === undefined || payload === null) return { content: '' };
@@ -119,7 +122,7 @@ function isComponentsV2(payload) {
   return Boolean(payload.flags && (Number(payload.flags) & IS_COMPONENTS_V2));
 }
 
-async function addCard(rawPayload, { cards, discord }) {
+async function addCard(rawPayload, { cards, discord, budgetMs }) {
   // keepEmbed: pesan ini tetap embed (mis. panel obfuscate). Penanda dibuang sebelum dikirim.
   if (rawPayload && typeof rawPayload === 'object' && rawPayload.keepEmbed) {
     const { keepEmbed, ...rest } = rawPayload;
@@ -130,12 +133,13 @@ async function addCard(rawPayload, { cards, discord }) {
   const { title, subtitle } = pickTexts(forCard(payload));
   let png;
   try {
-    png = await cards.renderInfoCard({ title, subtitle, accent: pickAccent(payload) });
+    png = await cards.renderInfoCard({ title, subtitle, accent: pickAccent(payload), budgetMs });
   } catch {
     return rawPayload;   // render gagal: kirim pesan asli
   }
   const { AttachmentBuilder } = discord;
-  const files = [...(payload.files || []), new AttachmentBuilder(png, { name: IMAGE_NAME })];
+  const name = typeof cards.cardFileName === 'function' ? cards.cardFileName(IMAGE_BASE, png) : `${IMAGE_BASE}.png`;
+  const files = [...(payload.files || []), new AttachmentBuilder(png, { name })];
   // Tanpa embed: kartu jadi gambar. Baris yang berisi mention ditaruh sebagai teks di atas gambar.
   return { ...payload, content: mentionLines(payload), embeds: [], files };
 }
@@ -167,8 +171,9 @@ function install({ cards, discord }) {
       const orig = proto[method];
       const wrapped = async function wrappedWithCard(payload, ...rest) {
         let next = payload;
+        const firstReply = method === 'reply' && this.deferred === false && this.replied === false;
         try {
-          next = await addCard(payload, { cards, discord });
+          next = await addCard(payload, { cards, discord, budgetMs: firstReply ? TIGHT_BUDGET_MS : undefined });
         } catch {
           next = payload;
         }

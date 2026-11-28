@@ -1,14 +1,17 @@
 'use strict';
 
-// Kartu gambar PNG untuk welcome, goodbye, level, dan leaderboard.
+// Kartu gambar untuk welcome, goodbye, level, leaderboard, obfuscate, dan info.
+// Bergaya banner: latarnya frame banner.gif, jadi kartu keluar sebagai GIF animasi (lihat animate.js).
+// Tanpa ffmpeg atau banner.gif, kartu keluar sebagai PNG statis dengan latar laut yang digambar sendiri.
 // Pakai @napi-rs/canvas (binary prebuilt, tanpa dependency sistem). Kalau paketnya belum
 // terpasang, isAvailable() bernilai false dan index.js jatuh ke embed lama.
 //
-// Font: taruh file .ttf di ./assets/font.ttf. Tanpa file itu dipakai 'sans-serif' sistem,
+// Font: taruh file .ttf di ./font.ttf (folder bot, sejajar index.js). Tanpa file itu dipakai 'sans-serif' sistem,
 // dan di host yang tidak punya font, huruf akan jadi kotak kosong.
 
 const fs = require('node:fs');
 const path = require('node:path');
+const animate = require('./animate');
 
 let napi = null;
 try {
@@ -120,8 +123,10 @@ function drawAvatar(ctx, img, cx, cy, r, ringWidth, ringColor, label) {
   ctx.restore();
 }
 
-// Latar galaksi: gradasi ruang, awan nebula, lengan spiral, dan bintang kecil.
-// Acaknya pakai seed tetap, jadi hasilnya sama setiap render.
+// ============ latar bergaya banner.gif (laut biru) ============
+// Mode animasi: kanvas kartu hanya berisi lapisan (scrim, panel, teks, avatar) dengan alpha,
+// lalu animate.js menumpuknya di atas frame banner.gif.
+// Mode statis: dasar laut digambar dulu di kanvas yang sama. Acaknya pakai seed tetap.
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function next() {
@@ -133,65 +138,84 @@ function mulberry32(seed) {
   };
 }
 
-function drawGalaxyBackground(ctx, w, h) {
-  const rand = mulberry32(0x9e3779b9);
-
-  const base = ctx.createLinearGradient(0, 0, w, h);
-  base.addColorStop(0, '#05030f');
-  base.addColorStop(0.5, '#0b0630');
-  base.addColorStop(1, '#02040c');
+function drawStaticSea(ctx, w, h) {
+  const rand = mulberry32(0x51ea5eed);
+  const base = ctx.createLinearGradient(0, 0, 0, h);
+  base.addColorStop(0, '#2d6fd0');
+  base.addColorStop(0.55, '#1b4aa6');
+  base.addColorStop(1, '#0c2a6b');
   ctx.fillStyle = base;
   ctx.fillRect(0, 0, w, h);
 
-  const nebulae = [
-    [w * 0.18, h * 0.3, w * 0.35, 'rgba(120, 60, 255, 0.35)'],
-    [w * 0.85, h * 0.75, w * 0.4, 'rgba(255, 70, 160, 0.25)'],
-    [w * 0.5, h * 0.5, w * 0.55, 'rgba(40, 140, 255, 0.16)'],
-  ];
-  for (const [x, y, r, color] of nebulae) {
-    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
-    g.addColorStop(0, color);
-    g.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, w, h);
-  }
+  const light = ctx.createRadialGradient(w * 0.72, h * 0.1, 0, w * 0.72, h * 0.1, w * 0.6);
+  light.addColorStop(0, 'rgba(170, 220, 255, 0.5)');
+  light.addColorStop(1, 'rgba(170, 220, 255, 0)');
+  ctx.fillStyle = light;
+  ctx.fillRect(0, 0, w, h);
 
-  for (let i = 0; i < 350; i++) {
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < 40; i++) {
     const x = rand() * w;
     const y = rand() * h;
-    const s = rand() * 1.4 + 0.3;
-    ctx.fillStyle = `rgba(255, 255, 255, ${(0.3 + rand() * 0.7).toFixed(2)})`;
+    const r = rand() * 5 + 1.5;
+    ctx.strokeStyle = `rgba(220, 240, 255, ${(0.2 + rand() * 0.4).toFixed(2)})`;
     ctx.beginPath();
-    ctx.arc(x, y, s, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.stroke();
   }
+}
 
-  // dua lengan spiral, dibuat tipis (squish) supaya terlihat seperti galaksi miring
-  const gx = w * 0.78;
-  const gy = h * 0.5;
-  const armColors = ['190, 170, 255', '255, 190, 230'];
-  for (let arm = 0; arm < 2; arm++) {
-    for (let i = 0; i < 700; i++) {
-      const t = rand();
-      const r = 20 + t * w * 0.3;
-      const ang = t * 4.2 + arm * Math.PI + (rand() - 0.5) * 0.5;
-      const jitter = (rand() - 0.5) * (14 + t * 30);
-      const x = gx + Math.cos(ang) * r + jitter;
-      const y = gy + Math.sin(ang) * r * 0.45 + jitter * 0.5;
-      const alpha = (0.2 + rand() * 0.6 * (1 - t * 0.6)).toFixed(2);
-      ctx.fillStyle = `rgba(${armColors[arm]}, ${alpha})`;
-      ctx.beginPath();
-      ctx.arc(x, y, rand() * 1.6 + 0.4, 0, Math.PI * 2);
-      ctx.fill();
-    }
+// Lapisan penggelap supaya teks putih terbaca di atas banner yang terang.
+// variant 'left': gelap di kiri (teks rata kiri). 'even': merata (teks di tengah atau selebar kartu).
+function drawScrim(ctx, w, h, variant) {
+  ctx.save();
+  if (variant === 'even') {
+    ctx.fillStyle = 'rgba(5, 18, 52, 0.6)';
+  } else {
+    const g = ctx.createLinearGradient(0, 0, w, 0);
+    g.addColorStop(0, 'rgba(4, 14, 40, 0.9)');
+    g.addColorStop(0.5, 'rgba(6, 24, 66, 0.66)');
+    g.addColorStop(1, 'rgba(8, 40, 96, 0.45)');
+    ctx.fillStyle = g;
   }
-
-  const core = ctx.createRadialGradient(gx, gy, 0, gx, gy, w * 0.08);
-  core.addColorStop(0, 'rgba(255, 240, 220, 0.9)');
-  core.addColorStop(0.4, 'rgba(255, 200, 150, 0.35)');
-  core.addColorStop(1, 'rgba(0, 0, 0, 0)');
-  ctx.fillStyle = core;
   ctx.fillRect(0, 0, w, h);
+  const bottom = ctx.createLinearGradient(0, h * 0.55, 0, h);
+  bottom.addColorStop(0, 'rgba(3, 10, 30, 0)');
+  bottom.addColorStop(1, 'rgba(3, 10, 30, 0.72)');
+  ctx.fillStyle = bottom;
+  ctx.fillRect(0, h * 0.55, w, h * 0.45);
+  ctx.restore();
+}
+
+function beginCard(W, H, variant = 'left') {
+  const animated = animate.isReady();
+  const canvas = napi.createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  if (!animated) drawStaticSea(ctx, W, H);
+  drawScrim(ctx, W, H, variant);
+  return { canvas, ctx, animated };
+}
+
+// Mengembalikan Buffer GIF (mode animasi) atau PNG. Pakai cardFileName() untuk nama file yang cocok.
+// budgetMs: batas waktu render GIF; terlewati, kartu jatuh ke PNG statis.
+async function finishCard({ canvas, animated }, { budgetMs } = {}) {
+  const png = await canvas.encode('png');
+  if (!animated) return png;
+  try {
+    return await animate.composeGif(png, canvas.width, canvas.height, { budgetMs });
+  } catch (err) {
+    console.warn('kartu animasi gagal, pakai PNG statis:', err.message);
+    const flat = napi.createCanvas(canvas.width, canvas.height);
+    const fctx = flat.getContext('2d');
+    drawStaticSea(fctx, canvas.width, canvas.height);
+    fctx.drawImage(canvas, 0, 0);
+    return flat.encode('png');
+  }
+}
+
+// Nama file lampiran mengikuti isi sebenarnya (GIF atau PNG), supaya Discord menampilkannya dengan benar.
+function cardFileName(base, buf) {
+  return `${base}.${animate.isGif(buf) ? 'gif' : 'png'}`;
 }
 
 // Kartu hasil obfuscate: avatar pemohon, status, detail, dan footer "Request by <nama>" dengan centang.
@@ -200,7 +224,7 @@ function drawGalaxyBackground(ctx, w, h) {
 const OBFU_SUB_TOP = 170;
 const OBFU_SUB_LINE = 32;
 
-async function renderObfuCard({ avatarUrl, requester, ok, title, lines }) {
+async function renderObfuCard({ avatarUrl, requester, ok, title, lines, budgetMs }) {
   const W = 934;
   const maxW = W - 280 - 40;
   // Ukur dulu di kanvas kecil, lalu tinggi kartu dihitung dari jumlah baris (tidak ada yang dipotong).
@@ -209,15 +233,10 @@ async function renderObfuCard({ avatarUrl, requester, ok, title, lines }) {
   const subLines = wrapLines(probe, (lines || []).join(' • '), maxW);
   const lastBaseline = OBFU_SUB_TOP + Math.max(0, subLines.length - 1) * OBFU_SUB_LINE;
   const H = Math.max(300, Math.ceil(lastBaseline + 90));
-  const canvas = napi.createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
+  const card = beginCard(W, H, 'left');
+  const { ctx } = card;
   const accent = ok ? '#57f287' : '#ed4245';
 
-  ctx.save();
-  roundRectPath(ctx, 0, 0, W, H, 28);
-  ctx.clip();
-  drawGalaxyBackground(ctx, W, H);
-  ctx.restore();
   ctx.save();
   ctx.strokeStyle = accent;
   ctx.globalAlpha = 0.6;
@@ -279,7 +298,7 @@ async function renderObfuCard({ avatarUrl, requester, ok, title, lines }) {
   ctx.fillStyle = '#8fa6d9';
   ctx.font = font('bold', 16);
   ctx.fillText('ALLZXRAA COMMUNITY', left, H - 18);
-  return canvas.encode('png');
+  return finishCard(card, { budgetMs });
 }
 
 function drawBar(ctx, x, y, w, h, ratio, fillFrom, fillTo) {
@@ -301,12 +320,11 @@ function drawBar(ctx, x, y, w, h, ratio, fillFrom, fillTo) {
 }
 
 // ============ kartu welcome / goodbye ============
-async function renderEventCard({ avatarUrl, name, title, subtitle }) {
+async function renderEventCard({ avatarUrl, name, title, subtitle, budgetMs }) {
   const W = 1000;
   const H = 450;
-  const canvas = napi.createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-  drawGalaxyBackground(ctx, W, H);
+  const card = beginCard(W, H, 'even');
+  const { ctx } = card;
 
   const img = await loadAvatar(avatarUrl);
   drawAvatar(ctx, img, W / 2, H * 0.37, 100, 7, '#ffffff', name);
@@ -319,7 +337,7 @@ async function renderEventCard({ avatarUrl, name, title, subtitle }) {
   ctx.fillStyle = '#b8c7ff';
   ctx.font = font('normal', 26);
   ctx.fillText(fitText(ctx, subtitle, W * 0.9), W / 2, H * 0.88);
-  return canvas.encode('png');
+  return finishCard(card, { budgetMs });
 }
 
 function renderWelcomeCard({ avatarUrl, name, memberCount }) {
@@ -343,14 +361,9 @@ function renderGoodbyeCard({ avatarUrl, name, memberCount }) {
 async function renderLevelCard(data) {
   const W = 934;
   const H = 300;
-  const canvas = napi.createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
+  const card = beginCard(W, H, 'left');
+  const { ctx } = card;
 
-  ctx.save();
-  roundRectPath(ctx, 0, 0, W, H, 28);
-  ctx.clip();
-  drawGalaxyBackground(ctx, W, H);
-  ctx.restore();
   ctx.save();
   ctx.strokeStyle = 'rgba(77, 148, 255, 0.5)';
   ctx.lineWidth = 2;
@@ -389,20 +402,19 @@ async function renderLevelCard(data) {
   );
 
   drawBar(ctx, left, 215, W - left - 40, 34, data.ratio, '#3d8bff', '#8fd0ff');
-  return canvas.encode('png');
+  return finishCard(card, { budgetMs: data.budgetMs });
 }
 
 // ============ kartu leaderboard ============
 // rows: [{ name, avatarUrl, level, xp, ratio }] sudah terurut
-async function renderLeaderboardCard({ guildName, rows }) {
+async function renderLeaderboardCard({ guildName, rows, budgetMs }) {
   const W = 900;
   const ROW_STEP = 84;
   const HEADER = 140;
   const count = Math.max(1, rows.length);
   const H = HEADER + count * ROW_STEP + 20;
-  const canvas = napi.createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-  drawGalaxyBackground(ctx, W, H);
+  const card = beginCard(W, H, 'even');
+  const { ctx } = card;
 
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
@@ -417,14 +429,14 @@ async function renderLeaderboardCard({ guildName, rows }) {
     ctx.font = font('normal', 26);
     ctx.fillStyle = '#ffffff';
     ctx.fillText('Belum ada yang dapat XP.', 40, HEADER + 50);
-    return canvas.encode('png');
+    return finishCard(card, { budgetMs });
   }
 
   const avatars = await Promise.all(rows.map((r) => loadAvatar(r.avatarUrl)));
   rows.forEach((r, i) => {
     const y = HEADER + i * ROW_STEP;
     roundRectPath(ctx, 30, y, W - 60, 72, 18);
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.07)';
+    ctx.fillStyle = 'rgba(6, 20, 56, 0.5)';
     ctx.fill();
 
     ctx.beginPath();
@@ -454,7 +466,7 @@ async function renderLeaderboardCard({ guildName, rows }) {
     ctx.font = font('normal', 18);
     ctx.fillText(`${formatNumber(r.xp)} XP`, W - 55, y + 58);
   });
-  return canvas.encode('png');
+  return finishCard(card, { budgetMs });
 }
 
 // ============ kartu info (dipakai untuk balasan bot yang belum punya gambar) ============
@@ -539,7 +551,7 @@ const INFO_W = 1000;
 const INFO_MIN_H = 400;
 const INFO_PANEL_PAD = 30;
 
-async function renderInfoCard({ title, subtitle, accent }) {
+async function renderInfoCard({ title, subtitle, accent, budgetMs }) {
   const W = INFO_W;
   const color = /^#[0-9a-fA-F]{6}$/.test(accent || '') ? accent : DEFAULT_ACCENT;
   const maxW = W - 60 - 120;
@@ -553,9 +565,8 @@ async function renderInfoCard({ title, subtitle, accent }) {
   const contentLast = subLines.length > 0 ? titleLast + 72 + (subLines.length - 1) * 38 : titleLast;
   // footer ada di H - 56; harus berada di bawah baris terakhir dengan jarak aman.
   const H = Math.max(INFO_MIN_H, Math.ceil(contentLast + 96));
-  const canvas = napi.createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-  drawGalaxyBackground(ctx, W, H);
+  const card = beginCard(W, H, 'even');
+  const { ctx } = card;
   drawAccentGlow(ctx, W - 80, 60, 320, color);
   drawAccentGlow(ctx, 60, H - 40, 220, color);
 
@@ -623,11 +634,12 @@ async function renderInfoCard({ title, subtitle, accent }) {
   ctx.fillStyle = color;
   ctx.font = font('bold', 16);
   ctx.fillText('ALLZXRAA COMMUNITY', left, PY + PH - 26);
-  return canvas.encode('png');
+  return finishCard(card, { budgetMs });
 }
 
 module.exports = {
   isAvailable,
+  cardFileName,
   renderWelcomeCard,
   renderGoodbyeCard,
   renderLevelCard,
